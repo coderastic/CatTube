@@ -13,8 +13,9 @@ work when your screen and graphics can take them.
   You sign in the TV way: CatTube shows a code and you type it at
   google.com/device on your phone. More than one account works. Not signed
   in, Home shows what is live and the latest in gaming, news and sports.
-- **Search** with suggestions as you type. Results come as the matching
-  channels first, then a grid of videos that keeps loading as you scroll.
+- **Search** with suggestions as you type, and your recent searches when
+  the box is empty. Results come as the matching channels first, then a
+  grid of videos that keeps loading as you scroll.
 - **A player made for the remote.** OK shows the controls, Left and Right
   skip 10 seconds, Up goes to the progress bar. Speed, quality, subtitles
   and audio tracks are a button away, chapters show on the bar, and you can
@@ -30,23 +31,23 @@ work when your screen and graphics can take them.
   Settings, Watch on TV, Link with TV code, and type the code from
   CatTube's Settings. The phone then picks what plays, and play, pause,
   seeking, volume and next stay in step on both.
-- **It remembers where you stopped** in every video. Signed in, what you
-  watch also goes into your YouTube history (you can turn that off).
+- **History** lists what you watched, and CatTube remembers where you
+  stopped in every video.
 - **A mouse works too.** Point at something to pick it, click to open it.
 
 ## Install
 
-**Flatpak.** Download `CatTube-1.0.0-x86_64.flatpak` from the
+**Flatpak.** Download `CatTube-1.0.1-x86_64.flatpak` from the
 [releases](https://github.com/coderastic/CatTube/releases), then:
 
 ```sh
-flatpak install --user CatTube-1.0.0-x86_64.flatpak
+flatpak install --user CatTube-1.0.1-x86_64.flatpak
 flatpak run io.github.coderastic.CatTube
 ```
 
 Flatpak fetches the Freedesktop runtime from Flathub if you don't have it.
 
-**AppImage.** Download `CatTube-1.0.0-x86_64.AppImage`, make it executable
+**AppImage.** Download `CatTube-1.0.1-x86_64.AppImage`, make it executable
 and run it. It brings its own mpv; it needs Python 3 and curl, which almost
 every distribution has.
 
@@ -87,9 +88,9 @@ The first time it starts, CatTube downloads its own copy of
 ## Your files
 
 Settings, your accounts and the phone pairing are in `~/.config/cattube/`
-(the accounts and the pairing only readable by you). Where you stopped in
-each video is in `~/.local/share/cattube/positions.conf`, and pictures are
-cached in `~/.cache/cattube/`. Signing out in Settings also cancels the
+(the accounts and the pairing only readable by you). What you watched,
+where you stopped and your recent searches are in `~/.local/share/cattube/`,
+and pictures are cached in `~/.cache/cattube/`. Signing out in Settings also cancels the
 sign-in at Google.
 
 ## Thanks

@@ -136,7 +136,7 @@ fn tv_name() -> String {
 
 /// The kept screen, or a new one from YouTube.
 pub fn screen(config: &Path) -> Result<Screen, String> {
-    // The pairing is the TV's identity to the phone app: owner only.
+    // The pairing is the TV's identity to the phone app: only for this user.
     cattube_core::util::make_private(&screen_path(config));
     if let Some(s) = std::fs::read_to_string(screen_path(config))
         .ok()

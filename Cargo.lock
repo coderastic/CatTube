@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "cattube"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cattube-core",
  "eframe",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "cattube-core"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "cc"
