@@ -861,54 +861,6 @@ pub fn explore(topics: Vec<(&str, Page)>, per_topic: usize) -> Page {
 
 // ---------------------------------------------------------------- history
 
-/// `player` for a video: what YouTube needs to know it was watched
-/// (signed in only; signed out it asks to sign in).
-pub fn player_body(ctx: &str, id: &str) -> Option<String> {
-    next_body(ctx, id)
-}
-
-/// The two addresses that put a video in the account's history.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Tracking {
-    pub playback: String,
-    pub watchtime: String,
-}
-
-fn tracking_ok(u: &str) -> bool {
-    (u.starts_with("https://s.youtube.com/") || u.starts_with("https://www.youtube.com/"))
-        && !u
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || b == b'"' || b == b'\\')
-}
-
-pub fn parse_tracking(body: &str) -> Option<Tracking> {
-    let v = parse_json(body.trim())?;
-    let t = v.get("playbackTracking")?;
-    let url = |k: &str| {
-        path(t, &[k, "baseUrl"])
-            .and_then(Json::as_str)
-            .filter(|u| tracking_ok(u))
-            .map(str::to_string)
-    };
-    Some(Tracking {
-        playback: url("videostatsPlaybackUrl")?,
-        watchtime: url("videostatsWatchtimeUrl")?,
-    })
-}
-
-/// A ping to one of them, the way yt-dlp's `--mark-watched` sends it:
-/// `cpn` names this viewing; the watch time one says how far it got
-/// (`st` to `et`, seconds).
-pub fn tracking_url(base: &str, cpn: &str, pos: f64, watchtime: bool) -> String {
-    let sep = if base.contains('?') { '&' } else { '?' };
-    let at = format!("{:.1}", pos.max(0.0));
-    let mut u = format!("{base}{sep}ver=2&cpn={cpn}&cmt={at}&el=detailpage");
-    if watchtime {
-        u.push_str(&format!("&st=0&et={at}"));
-    }
-    u
-}
-
 // -------------------------------------------------------------- live chat
 
 /// Live chat only comes through the web client (the TV one has none).
@@ -1163,33 +1115,6 @@ mod tests {
         );
         let titles: Vec<&str> = p.shelves.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, ["Live", "Live Now", "Gaming: Top live games"]);
-    }
-
-    #[test]
-    fn history_pings() {
-        assert!(
-            player_body("{}", "WhWc3b3KhnY")
-                .unwrap()
-                .contains("\"videoId\":\"WhWc3b3KhnY\"")
-        );
-        assert!(player_body("{}", "bad").is_none());
-        let r = r#"{"playbackTracking":{"videostatsPlaybackUrl":{"baseUrl":"https://s.youtube.com/api/stats/playback?cl=1&docid=WhWc3b3KhnY&len=464"},"videostatsWatchtimeUrl":{"baseUrl":"https://s.youtube.com/api/stats/watchtime?cl=1&docid=WhWc3b3KhnY"}}}"#;
-        let t = parse_tracking(r).unwrap();
-        assert_eq!(
-            tracking_url(&t.playback, "abcDEF0123456789", 0.0, false),
-            "https://s.youtube.com/api/stats/playback?cl=1&docid=WhWc3b3KhnY&len=464&ver=2&cpn=abcDEF0123456789&cmt=0.0&el=detailpage"
-        );
-        assert!(
-            tracking_url(&t.watchtime, "c", 61.26, true)
-                .ends_with("&cmt=61.3&el=detailpage&st=0&et=61.3")
-        );
-        // Only YouTube's own addresses.
-        assert!(
-            parse_tracking(&r.replace("https://s.youtube.com", "https://evil.example")).is_none()
-        );
-        assert!(
-            parse_tracking("{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\"}}").is_none()
-        );
     }
 
     #[test]

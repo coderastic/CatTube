@@ -522,7 +522,6 @@ impl Remote {
             sponsorblock: p.sponsorblock.then(|| p.sb_categories.clone()),
             codec: p.codec,
             hdr: p.hdr,
-            history: p.history,
             region: p.region.clone(),
             queue: Vec::new(),
         };

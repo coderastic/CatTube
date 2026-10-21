@@ -434,34 +434,6 @@ fn follow_chat(first: String, region: String, on: std::sync::Arc<std::sync::atom
     });
 }
 
-/// A video started: tell YouTube (it goes into the history). Returns the
-/// watch time address and this viewing's id, for [`history_progress`].
-pub fn history_start(ctx: &str, id: &str, refresh: &str) -> Result<(String, String), String> {
-    let t = bearer(refresh)?;
-    let body = yt::player_body(ctx, id).ok_or("not a video")?;
-    let reply = curl(&yt::endpoint_url("player"), Some(&body), Some(&t))?;
-    let tr = yt::parse_tracking(&reply).ok_or("YouTube gave no history address")?;
-    let cpn = yt_cpn();
-    curl(
-        &yt::tracking_url(&tr.playback, &cpn, 0.0, false),
-        None,
-        Some(&t),
-    )?;
-    Ok((tr.watchtime, cpn))
-}
-
-/// How far it got, so YouTube's red line and "resume" match.
-pub fn history_progress(watchtime: &str, cpn: &str, pos: f64, refresh: &str) -> Result<(), String> {
-    let t = bearer(refresh)?;
-    curl(&yt::tracking_url(watchtime, cpn, pos, true), None, Some(&t)).map(|_| ())
-}
-
-/// A viewing's id: 16 characters from YouTube's alphabet.
-fn yt_cpn() -> String {
-    let r = cattube_core::util::random_hex(16).unwrap_or_default();
-    cattube_core::lounge::cpn(r.as_bytes())
-}
-
 /// Comments for the control bar, as JSON: `{"list":[{"a","t","p","l","r"}],
 /// "more":"…"}` or `{"error":"…"}`.
 fn comments_json(r: Result<yt::Comments, String>) -> String {
@@ -761,8 +733,6 @@ pub struct Session {
     pub sponsorblock: Option<Vec<String>>,
     pub codec: cattube_core::player::Codec,
     pub hdr: bool,
-    /// Signed in: report what plays to the account's history.
-    pub history: bool,
     /// For live chat ("US").
     pub region: String,
     /// Videos after this one (a playlist or a row), in order.
@@ -911,29 +881,8 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                         }
                     });
                 }
-                // History (signed in): this video started.
-                let report: std::sync::Arc<Mutex<Option<(String, String)>>> = Default::default();
-                if s.history
-                    && let Some(refresh) = s.refresh.clone()
-                {
-                    let (ctx, id, report) = (s.ctx.clone(), cur.id.clone(), report.clone());
-                    std::thread::spawn(move || match history_start(&ctx, &id, &refresh) {
-                        Ok(r) => *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(r),
-                        Err(e) => eprintln!("cattube: history: {e}"),
-                    });
-                }
-                // ... and where it stopped (the chat stops with it).
-                let report_end = |pos: f64| {
-                    chat_on.store(false, std::sync::atomic::Ordering::SeqCst);
-                    let r = report.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    if let (Some((watchtime, cpn)), Some(refresh)) = (r, s.refresh.clone()) {
-                        std::thread::spawn(move || {
-                            if let Err(e) = history_progress(&watchtime, &cpn, pos, &refresh) {
-                                eprintln!("cattube: history: {e}");
-                            }
-                        });
-                    }
-                };
+                // The chat stops with the video.
+                let stop_chat = || chat_on.store(false, std::sync::atomic::Ordering::SeqCst);
                 let segments = s
                     .sponsorblock
                     .as_ref()
@@ -964,7 +913,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     let msgs = conn.messages(Duration::from_millis(400));
                     if conn.closed() {
                         ended.positions.push((cur.id.clone(), last.0, last.1));
-                        report_end(last.0);
+                        stop_chat();
                         break 'videos;
                     }
                     let pos = conn.get_f64("time-pos");
@@ -1113,7 +1062,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     if let Some(n) = go_next {
                         card(&mut conn, &["hide"]);
                         ended.positions.push((cur.id.clone(), last.0, last.1));
-                        report_end(last.0);
+                        stop_chat();
                         let backwards = want("cattube-episode").as_deref() == Some("prev");
                         if !backwards {
                             history.push(cur.clone());

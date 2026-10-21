@@ -54,8 +54,6 @@ pub struct Prefs {
     pub sb_categories: Vec<String>,
     /// Load-ahead in MiB (`player::BUFFERS`).
     pub buffer: u32,
-    /// Signed in: what plays goes into the account's YouTube history.
-    pub history: bool,
     /// Region for YouTube's lists ("IN", "US").
     pub region: String,
 }
@@ -73,7 +71,6 @@ impl Default for Prefs {
             autoplay: Autoplay::Next,
             sponsorblock: true,
             sb_categories: community::default_categories(),
-            history: true,
             buffer: 256,
             region: "US".into(),
         }
@@ -123,7 +120,6 @@ impl Prefs {
                     }
                 }
                 "sponsorblock" => p.sponsorblock = v != "false",
-                "history" => p.history = v != "false",
                 "buffer" => {
                     if let Ok(n) = v.parse::<u32>()
                         && cattube_core::player::BUFFERS.contains(&n)
@@ -154,7 +150,7 @@ impl Prefs {
 
     pub fn to_conf(&self) -> String {
         format!(
-            "# CatTube settings\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nhistory = {}\nbuffer = {}\nregion = {}\n",
+            "# CatTube settings\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\n",
             self.accent,
             self.max_height,
             self.codec.key(),
@@ -165,7 +161,6 @@ impl Prefs {
             self.autoplay.key(),
             self.sponsorblock,
             self.sb_categories.join(","),
-            self.history,
             self.buffer,
             self.region
         )
@@ -215,7 +210,6 @@ mod tests {
             autoplay: Autoplay::Loop,
             sponsorblock: false,
             sb_categories: vec!["sponsor".into(), "intro".into()],
-            history: false,
             buffer: 768,
             region: "DE".into(),
         };

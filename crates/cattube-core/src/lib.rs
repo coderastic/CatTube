@@ -16,6 +16,7 @@ pub mod process;
 pub mod scan;
 pub mod tube;
 pub mod util;
+pub mod watched;
 pub mod youtube;
 
 pub use error::{Error, Result};

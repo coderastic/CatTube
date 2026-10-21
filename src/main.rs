@@ -213,6 +213,12 @@ impl App {
         let yctx = self.yt_ctx();
         let refresh = self.refresh();
         match e {
+            // History is what was watched here.
+            Effect::Load(id) if id == ytc::feeds::HISTORY => {
+                let list = self.watched();
+                self.tube
+                    .on_page(&id, Ok(cattube_core::watched::page(&list)));
+            }
             Effect::Load(id) => self.jobs.spawn(move || {
                 let r = yt::page(&yctx, &id, refresh.as_deref());
                 Msg::Page(id, r)
@@ -404,7 +410,6 @@ impl App {
             SettingRow::Hdr => self.prefs.hdr = !self.prefs.hdr,
             SettingRow::Speed => self.prefs.speed = prefs::cycle(&SPEEDS, self.prefs.speed, d),
             SettingRow::Subtitles => self.prefs.subs_on = !self.prefs.subs_on,
-            SettingRow::History => self.prefs.history = !self.prefs.history,
             SettingRow::Buffer => {
                 self.prefs.buffer = prefs::cycle(&player::BUFFERS, self.prefs.buffer, d)
             }
@@ -456,7 +461,20 @@ impl App {
         self.save_prefs(ctx);
     }
 
+    fn watched(&self) -> Vec<Tile> {
+        std::fs::read_to_string(self.data.join("watched.conf"))
+            .map(|t| cattube_core::watched::parse(&t))
+            .unwrap_or_default()
+    }
+
     fn play(&mut self, ctx: &egui::Context, tile: Tile, from_start: bool, queue: Vec<Tile>) {
+        let mut list = self.watched();
+        cattube_core::watched::remember(&mut list, &tile);
+        let _ = std::fs::create_dir_all(&self.data);
+        let _ = std::fs::write(
+            self.data.join("watched.conf"),
+            cattube_core::watched::to_text(&list),
+        );
         if let Some(mut old) = self.player.take() {
             let _ = old.kill();
             let _ = old.wait();
@@ -500,7 +518,6 @@ impl App {
                         .then(|| self.prefs.sb_categories.clone()),
                     codec: self.prefs.codec,
                     hdr: self.prefs.hdr,
-                    history: self.prefs.history,
                     region: self.prefs.region.clone(),
                     queue,
                 };
@@ -824,31 +841,6 @@ fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) 
     let _ = std::fs::write(&path, player::positions_text(&list));
 }
 
-/// `--mark-watched ID`: put a video into the signed-in account's history
-/// (watched 30 s), the way playing it does. Says what YouTube answered.
-fn mark_watched(id: &str) -> i32 {
-    let config = cattube_core::env::config_dir();
-    let accounts = account::load(&config);
-    let Some(a) = accounts.active() else {
-        eprintln!("cattube: not signed in");
-        return 2;
-    };
-    let p = prefs::load(&config);
-    let ctx = ytc::context("en", &p.region);
-    match yt::history_start(&ctx, id, &a.refresh_token)
-        .and_then(|(watchtime, cpn)| yt::history_progress(&watchtime, &cpn, 30.0, &a.refresh_token))
-    {
-        Ok(()) => {
-            println!("in your history: {id}");
-            0
-        }
-        Err(e) => {
-            eprintln!("cattube: history: {e}");
-            1
-        }
-    }
-}
-
 fn feed(which: &str) -> i32 {
     let browse = match which {
         "home" | "recommended" => ytc::feeds::HOME,
@@ -959,13 +951,6 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         return Ok(());
-    }
-    if let Some(id) = args
-        .iter()
-        .position(|a| a == "--mark-watched")
-        .and_then(|i| args.get(i + 1))
-    {
-        std::process::exit(mark_watched(id));
     }
     if let Some(i) = args.iter().position(|a| a == "--feed") {
         std::process::exit(feed(

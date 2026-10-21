@@ -66,7 +66,7 @@ impl Section {
     }
 
     pub fn needs_sign_in(self) -> bool {
-        !matches!(self, Self::Home | Self::Search)
+        !matches!(self, Self::Home | Self::Search | Self::History)
     }
 }
 
@@ -127,8 +127,6 @@ pub enum SettingRow {
     Speed,
     Subtitles,
     Autoplay,
-    /// Save what plays to the account's YouTube history.
-    History,
     Buffer,
     /// The country recommendations are for.
     Region,
@@ -183,7 +181,6 @@ pub fn group_of(row: SettingRow) -> SettingGroup {
         SettingRow::Speed
         | SettingRow::Subtitles
         | SettingRow::Autoplay
-        | SettingRow::History
         | SettingRow::Buffer
         | SettingRow::Region => SettingGroup::Playback,
         SettingRow::SponsorBlock | SettingRow::Category(_) => SettingGroup::SponsorBlock,
@@ -215,7 +212,6 @@ pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
         SettingRow::Speed,
         SettingRow::Subtitles,
         SettingRow::Autoplay,
-        SettingRow::History,
         SettingRow::Buffer,
         SettingRow::Region,
         SettingRow::SponsorBlock,
@@ -785,7 +781,6 @@ impl Tube {
                                 | Some(SettingRow::UpdateYtDlp)
                                 | Some(SettingRow::Hdr)
                                 | Some(SettingRow::Subtitles)
-                                | Some(SettingRow::History)
                                 | Some(SettingRow::SponsorBlock)
                                 | Some(SettingRow::Category(_))
                                 | None,

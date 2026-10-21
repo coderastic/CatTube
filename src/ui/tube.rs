@@ -1475,13 +1475,6 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 RowKind::Toggle(Some(p.hdr)),
                 "spark",
             ),
-            SettingRow::History => (
-                "Save to YouTube history".into(),
-                "What you watch here shows in your history, with how far you got".into(),
-                String::new(),
-                RowKind::Toggle(Some(p.history)),
-                "check",
-            ),
             SettingRow::Buffer => (
                 "Buffer".into(),
                 "Bigger rides out a shaky connection, smaller uses less memory".into(),
