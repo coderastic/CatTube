@@ -68,6 +68,8 @@ struct App {
     jobs: Jobs<Msg>,
     mapper: InputMapper,
     pointer: pointer::Pointer,
+    /// Fading out before handing the screen back to CatosTV.
+    closing: Option<Instant>,
     hits: Vec<(egui::Rect, Target)>,
     images: images::Images,
     pictures: HashMap<String, Option<String>>,
@@ -127,6 +129,7 @@ impl App {
             jobs: Jobs::new(&cc.egui_ctx),
             mapper: InputMapper::new(),
             pointer: pointer::Pointer::new(),
+            closing: None,
             hits: Vec::new(),
             images: images::Images::new(),
             pictures: HashMap::new(),
@@ -366,7 +369,26 @@ impl App {
                 }
             }
             Effect::Setting(row, d) => self.setting(ctx, row, d),
-            Effect::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Effect::Close => {
+                // On CatosTV the window fades to dark first; the TV's own
+                // screen then fades in from dark, so nothing flashes between.
+                if std::env::var_os("CATOSTV_APP_ID").is_some() && self.closing.is_none() {
+                    self.closing = Some(Instant::now());
+                    ctx.request_repaint();
+                    return;
+                }
+                if hand_back_screen() {
+                    // The window is behind the TV's own screen now, where it
+                    // draws nothing and so would never act on a close
+                    // request: end here (the player goes with it).
+                    if let Some(mut p) = self.player.take() {
+                        let _ = p.kill();
+                        let _ = p.wait();
+                    }
+                    std::process::exit(0);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+            }
             Effect::Toast(t) => self.toast(ctx, &t),
         }
     }
@@ -529,6 +551,7 @@ impl App {
                     save_positions(&data, &ended.positions);
                     // Opened to play this one video: done, close now.
                     if quit {
+                        let _ = hand_back_screen();
                         std::process::exit(0);
                     }
                     let _ = tx.send(Msg::PlaybackDone(seq, ended));
@@ -725,10 +748,14 @@ impl eframe::App for App {
         }
         self.was_focused = focused;
         let events = keys::collect(&ctx);
-        let actions = self
+        let mut actions = self
             .mapper
             .map(&events, keys::now(&ctx), self.tube.text_mode());
-        let p = self.pointer.collect(&ctx);
+        let mut p = self.pointer.collect(&ctx);
+        if self.closing.is_some() {
+            actions.clear();
+            p = Default::default();
+        }
         let c = self.ctx();
         let positions = self.positions.clone();
         let resumable = move |id: &str| positions.iter().any(|(x, _)| x == id);
@@ -800,6 +827,22 @@ impl eframe::App for App {
         if self.toast.is_some() || self.loading() || !self.fetching.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+        if let Some(since) = self.closing {
+            const FADE: f32 = 0.22;
+            let t = (since.elapsed().as_secs_f32() / FADE).min(1.0);
+            let ease = t * t * (3.0 - 2.0 * t);
+            ui.painter().rect_filled(
+                ctx.content_rect(),
+                0.0,
+                egui::Color32::from_black_alpha((ease * 255.0) as u8),
+            );
+            if t >= 1.0 && since.elapsed().as_secs_f32() > FADE + 0.05 {
+                // A dark frame is on screen: hand over now.
+                self.effect(&ctx, Effect::Close);
+            } else {
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -824,6 +867,29 @@ enum Start {
 
 /// `--feed`: the newest videos of a list, one per line, for a TV home
 /// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
+/// Closing while a TV home screen started CatTube (CatosTV sets
+/// `CATOSTV_APP_ID` for the apps it opens): ask it to come back first, so
+/// what is behind CatTube's window never shows in between. True when it
+/// did.
+fn hand_back_screen() -> bool {
+    if std::env::var_os("CATOSTV_APP_ID").is_none() {
+        return false;
+    }
+    let asked = std::process::Command::new("catostv-ctl")
+        .arg("escape")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if asked {
+        // The switch takes a moment; this window is already out of sight,
+        // so waiting longer before it goes costs nothing.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    asked
+}
+
 /// Add where videos stopped to `positions.conf` (read, merge, write: the
 /// phone-remote service writes it too).
 fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) {
