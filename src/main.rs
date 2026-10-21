@@ -107,6 +107,16 @@ impl App {
             sponsorblock: prefs.sponsorblock,
         };
         let (mut tube, mut effects) = Tube::open(ctx);
+        tube.recent = std::fs::read_to_string(data.join("searches.txt"))
+            .map(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(cattube_core::tube::RECENT_SEARCHES)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut app = App {
             tube: tube.clone(),
             accounts,
@@ -211,9 +221,20 @@ impl App {
                 let r = yt::more(&yctx, &token, refresh.as_deref());
                 Msg::More(browse_id, token, r)
             }),
-            Effect::Search(q) => self
-                .jobs
-                .spawn(move || Msg::Search(yt::search(&yctx, &q, refresh.as_deref()))),
+            Effect::Search(q) => {
+                // Kept on this TV for next time (Search shows them first).
+                self.tube.remember_search(&q);
+                let list: String = self
+                    .tube
+                    .recent
+                    .iter()
+                    .map(|r| r.chars().filter(|c| !c.is_control()).collect::<String>() + "\n")
+                    .collect();
+                let _ = std::fs::create_dir_all(&self.data);
+                let _ = std::fs::write(self.data.join("searches.txt"), list);
+                self.jobs
+                    .spawn(move || Msg::Search(yt::search(&yctx, &q, refresh.as_deref())))
+            }
             Effect::SearchMore(t) => self
                 .jobs
                 .spawn(move || Msg::SearchMore(yt::search_more(&yctx, &t, refresh.as_deref()))),

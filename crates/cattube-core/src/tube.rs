@@ -332,9 +332,26 @@ pub struct Tube {
     /// Which pill has focus in the header: a tab, or `ALL.len()` = account.
     pub header_index: usize,
     pub error: Option<String>,
+    /// What was searched lately, newest first: shown in Search while the
+    /// box is empty.
+    pub recent: Vec<String>,
 }
 
+/// How many recent searches are kept.
+pub const RECENT_SEARCHES: usize = 20;
+
 impl Tube {
+    /// A search was made: it goes to the top of the recent ones.
+    pub fn remember_search(&mut self, q: &str) {
+        let q = q.trim();
+        if q.is_empty() {
+            return;
+        }
+        self.recent.retain(|r| !r.eq_ignore_ascii_case(q));
+        self.recent.insert(0, q.to_string());
+        self.recent.truncate(RECENT_SEARCHES);
+    }
+
     pub fn open(ctx: Ctx) -> (Self, Vec<Effect>) {
         let mut t = Tube {
             stack: vec![Screen::Browse],
@@ -345,6 +362,7 @@ impl Tube {
             header: false,
             header_index: 0,
             error: None,
+            recent: Vec::new(),
         };
         // Signed out, Home is nearly empty on YouTube's TV app: start in
         // Search's place on Home with its results instead.
@@ -382,6 +400,9 @@ impl Tube {
             // The keyboard has focus, not the top bar.
             self.header = false;
             self.stack.push(search_screen());
+            if let Some(Screen::Search { suggestions, .. }) = self.stack.last_mut() {
+                *suggestions = self.recent.clone();
+            }
             return vec![];
         }
         if s.needs_sign_in() && !ctx.signed_in {
@@ -507,6 +528,7 @@ impl Tube {
         if self.header && matches!(self.stack.last(), Some(Screen::Search { .. })) {
             return self.handle_search_header(action, ctx);
         }
+        let recent = self.recent.clone();
         let Some(screen) = self.stack.last_mut() else {
             return vec![Effect::Close];
         };
@@ -648,7 +670,9 @@ impl Tube {
                         if now != before && now.trim().len() >= 2 {
                             vec![Effect::Suggest(now)]
                         } else {
-                            if now.trim().len() < 2 {
+                            if now.trim().is_empty() {
+                                *suggestions = recent;
+                            } else if now.trim().len() < 2 {
                                 suggestions.clear();
                             }
                             vec![]
@@ -1595,6 +1619,32 @@ mod tests {
         t.handle(Back, IN, &no);
         assert!(matches!(t.screen(), Some(Screen::Browse)));
         assert_eq!(t.section, Section::Home);
+    }
+
+    #[test]
+    fn recent_searches_show_while_the_box_is_empty() {
+        let (mut t, _) = Tube::open(IN);
+        t.remember_search("cats");
+        t.remember_search("dogs ");
+        t.remember_search("Cats");
+        assert_eq!(t.recent, ["Cats", "dogs"]);
+        t.header = true;
+        t.header_index = search_tab();
+        t.handle(Ok, IN, &no);
+        let sugg = |t: &Tube| match t.screen() {
+            Some(Screen::Search { suggestions, .. }) => suggestions.clone(),
+            _ => vec![],
+        };
+        assert_eq!(sugg(&t), ["Cats", "dogs"]);
+        // Picking one searches it.
+        for _ in 0..12 {
+            t.handle(Right, IN, &no);
+        }
+        assert_eq!(t.handle(Ok, IN, &no), vec![Effect::Search("Cats".into())]);
+        for _ in 0..30 {
+            t.remember_search(&format!("q{}", t.recent.len()));
+        }
+        assert_eq!(t.recent.len(), RECENT_SEARCHES);
     }
 
     #[test]

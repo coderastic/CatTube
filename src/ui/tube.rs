@@ -888,6 +888,19 @@ fn draw_search(
         &Target::Key,
     );
     let x = 760.0;
+    // An empty box lists the recent searches instead of suggestions.
+    let recent = osk.text().trim().is_empty() && !suggestions.is_empty();
+    if recent {
+        c.text(
+            x + 22.0,
+            104.0,
+            Align2::LEFT_CENTER,
+            "Recent searches",
+            14.0,
+            theme::text3(),
+            Weight::Semibold,
+        );
+    }
     for (i, s) in suggestions.iter().enumerate().take(7) {
         let y = 118.0 + i as f32 * 50.0;
         let t = focus_t(c, ("tube-sugg", i), suggestion == Some(i) && !on_header);
@@ -896,7 +909,14 @@ fn draw_search(
         if t > 0.01 {
             widgets::focus_pill(c, r, 21.0, t);
         }
-        icons::draw(c, "search", x + 22.0, y + 21.0, 15.0, theme::text3());
+        icons::draw(
+            c,
+            if recent { "refresh" } else { "search" },
+            x + 22.0,
+            y + 21.0,
+            15.0,
+            theme::text3(),
+        );
         c.text(
             x + 44.0,
             y + 21.0,
