@@ -305,15 +305,19 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         &labels,
         selected,
         focus.filter(|i| *i < labels.len()),
+        focus.is_some_and(|i| i >= labels.len()),
     );
     for (i, rect) in rects.iter().enumerate() {
         c.hit(*rect, Target::Tube(usize::MAX, i));
     }
     let w = acct_w;
     let rect = c.r(1216.0 - w, y + 2.0, w, 48.0);
+    // Focused: the same accent pill as the tabs.
     let t = focus_t(c, "tube-acct", focus == Some(labels.len()));
     c.glass(rect, 24.0);
-    widgets::focus_pill(c, rect, 24.0, t);
+    if t > 0.01 {
+        widgets::bar_pill(c, rect, 24.0, t);
+    }
     let x = 1216.0 - w;
     let cy = y + 26.0;
     let photo = v
@@ -329,14 +333,20 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
             Color32::WHITE,
         ),
         None => {
-            c.circle(x + 26.0, cy, 15.0, theme::accent());
+            // The initial's disc swaps colours on the accent pill.
+            c.circle(
+                x + 26.0,
+                cy,
+                15.0,
+                widgets::mix(theme::accent(), theme::on_accent(), t),
+            );
             c.text(
                 x + 26.0,
                 cy,
                 Align2::CENTER_CENTER,
                 &name.chars().take(1).collect::<String>().to_uppercase(),
                 15.0,
-                theme::on_accent(),
+                widgets::mix(theme::on_accent(), theme::accent(), t),
                 Weight::Semibold,
             );
         }
@@ -347,10 +357,17 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         Align2::LEFT_CENTER,
         name,
         16.0,
-        theme::text(),
+        widgets::mix(theme::text(), theme::on_accent(), t),
         Weight::Semibold,
     );
-    icons::draw(c, "gear", x + w - 26.0, cy, 16.0, theme::text2());
+    icons::draw(
+        c,
+        "gear",
+        x + w - 26.0,
+        cy,
+        16.0,
+        widgets::mix(theme::text2(), theme::on_accent(), t),
+    );
     c.hit(rect, Target::Tube(usize::MAX, labels.len()));
 }
 
