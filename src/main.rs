@@ -68,6 +68,8 @@ struct App {
     jobs: Jobs<Msg>,
     mapper: InputMapper,
     pointer: pointer::Pointer,
+    /// Where the pointer was last seen.
+    pointer_at: Option<egui::Pos2>,
     /// Fading out before handing the screen back to CatosTV.
     closing: Option<Instant>,
     hits: Vec<(egui::Rect, Target)>,
@@ -129,6 +131,7 @@ impl App {
             jobs: Jobs::new(&cc.egui_ctx),
             mapper: InputMapper::new(),
             pointer: pointer::Pointer::new(),
+            pointer_at: None,
             closing: None,
             hits: Vec::new(),
             images: images::Images::new(),
@@ -769,8 +772,16 @@ impl eframe::App for App {
             Some(t @ (Target::Key(..) | Target::Suggestion(_))) => ui::tube::focus_search(tube, t),
             _ => false,
         };
+        // Only a pointer that really moves picks things: the window opening
+        // under a resting pointer reports a move too.
         if let Some(pos) = p.moved_to {
-            point(&mut self.tube, hit_test(&self.hits, pos));
+            let moved = self
+                .pointer_at
+                .map_or(ctx.input(|i| i.time) > 1.5, |at| (at - pos).length() > 2.0);
+            self.pointer_at = Some(pos);
+            if moved {
+                point(&mut self.tube, hit_test(&self.hits, pos));
+            }
         }
         if let Some(pos) = p.click
             && point(&mut self.tube, hit_test(&self.hits, pos))
