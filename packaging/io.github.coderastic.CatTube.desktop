@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=CatTube
+GenericName=YouTube for the TV
+Comment=Watch YouTube on the big screen with a remote
+Exec=cattube
+Icon=io.github.coderastic.CatTube
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=youtube;video;tv;remote;
+StartupWMClass=io.github.coderastic.CatTube

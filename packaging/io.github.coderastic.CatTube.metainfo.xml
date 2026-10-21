@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.coderastic.CatTube</id>
+  <name>CatTube</name>
+  <summary>YouTube for the TV, driven with a remote</summary>
+  <developer id="io.github.coderastic">
+    <name>coderastic</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      CatTube is a YouTube app for a Linux computer under the TV. It opens
+      full screen and you use it with arrows, OK and Back: a remote, a
+      keyboard or a game controller. There are no ads.
+    </p>
+    <ul>
+      <li>Home, Subscriptions, History, Playlists and Channels once you sign in with a code</li>
+      <li>Search with suggestions, channels first, then a grid of videos</li>
+      <li>A player made for the remote, with speed, quality, subtitles, chapters, comments and live chat</li>
+      <li>SponsorBlock skips sponsors and intros, Return YouTube Dislike brings back dislikes</li>
+      <li>Use the YouTube app on your phone as a remote</li>
+    </ul>
+    <p>CatTube is not made by or connected to YouTube or Google.</p>
+  </description>
+  <launchable type="desktop-id">io.github.coderastic.CatTube.desktop</launchable>
+  <url type="homepage">https://github.com/coderastic/CatTube</url>
+  <url type="bugtracker">https://github.com/coderastic/CatTube/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-10-21"/>
+  </releases>
+</component>
