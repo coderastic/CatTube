@@ -141,9 +141,9 @@ local function rect(a, x, y, w, h, r)
 end
 
 local function text_width(label, size)
-    -- Rough: the font is proportional, 0.56 em per character is close for
+    -- Rough: the font is proportional, 0.52 em per character is close for
     -- the labels used here.
-    return #label * size * 0.56
+    return #label * size * 0.52
 end
 
 local render_menu, render_card, render_chat -- below
@@ -214,11 +214,17 @@ local function render()
     pause_button.label = paused and "Play" or "Pause"
 
     local a = assdraw.ass_new()
-    -- A dark band along the bottom with a soft top edge.
+    -- The picture darkens towards the bottom so the controls read on
+    -- anything: a wide soft fade, then a deeper band behind the buttons.
     a:new_event()
-    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur80\\1c&H000000&\\1a&H48&}")
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur140\\1c&H000000&\\1a&H60&}")
     a:draw_start()
-    a:rect_cw(-200, 820, W + 200, H + 200)
+    a:rect_cw(-200, 700, W + 200, H + 200)
+    a:draw_stop()
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur70\\1c&H000000&\\1a&H50&}")
+    a:draw_start()
+    a:rect_cw(-200, 880, W + 200, H + 200)
     a:draw_stop()
     -- Title: "Series · S1:E3 · Name" becomes a small "Series · S1:E3"
     -- over the episode's name.
@@ -226,23 +232,23 @@ local function render()
     local series, ep, name = clean:match("^(.-) · (S%d+:E%d+) · (.+)$")
     if series then
         a:new_event()
-        a:append("{\\an1\\pos(120,852)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H50&}" .. series .. " · " .. ep)
+        a:append("{\\an1\\pos(120,792)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H50&}" .. series .. " · " .. ep)
         clean = name
     end
     a:new_event()
-    a:append("{\\an1\\pos(120,904)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. clean)
+    a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. clean)
     -- When it ends, like a TV guide (a stream: that it is live).
     if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then
         a:new_event()
-        a:append("{\\an3\\pos(1800,904)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
+        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
     elseif dur > 0 then
         local speed = mp.get_property_number("speed", 1)
         local ends = os.time() + math.max(0, dur - pos) / (speed > 0 and speed or 1)
         a:new_event()
-        a:append("{\\an3\\pos(1800,904)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H40&}Ends at " .. os.date("%H:%M", math.floor(ends)))
+        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H40&}Ends at " .. os.date("%H:%M", math.floor(ends)))
     end
     -- Progress track and fill.
-    local tx, ty, tw, th = 120, 930, 1680, 8
+    local tx, ty, tw, th = 120, 874, 1680, 8
     a:new_event()
     a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HB0&}")
     a:draw_start()
@@ -297,9 +303,9 @@ local function render()
     -- Times.
     a:new_event()
     local chapter = chapter_title()
-    a:append(string.format("{\\an7\\pos(120,950)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H30&}%s", clock(pos) .. (chapter and ("  ·  " .. chapter) or "")))
+    a:append(string.format("{\\an7\\pos(120,898)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H30&}%s", clock(pos) .. (chapter and ("  ·  " .. chapter) or "")))
     a:new_event()
-    a:append(string.format("{\\an9\\pos(1800,950)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H30&}%s", clock(dur)))
+    a:append(string.format("{\\an9\\pos(1800,898)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H30&}%s", clock(dur)))
     -- Buttons: episodes from the left edge, playback centred, tracks to
     -- the right edge.
     -- Smaller when they would not fit side by side (both video buttons,
@@ -317,13 +323,14 @@ local function render()
         if group_w.ep + group_w.play + group_w.track + 2 * 48 <= W - 240 then break end
     end
     local start = { ep = 120, play = (W - group_w.play) / 2, track = W - 120 - group_w.track }
-    -- Playback slides left when the track buttons would reach it (never
-    -- into the episode buttons).
+    -- Not enough room to centre playback: it lines up on the left (after
+    -- the previous / next buttons), the rest stays on the right.
     local space = 48
     if start.play + group_w.play + space > start.track then
-        start.play = math.max(120 + group_w.ep + space, start.track - space - group_w.play)
+        start.play = 120 + (group_w.ep > 0 and group_w.ep + space or 0)
     end
-    local by = 992
+    -- Well clear of the bottom edge (TVs crop it).
+    local by = 952
     for i, b in ipairs(shown_buttons) do
         local x = start[b.group]
         start[b.group] = x + widths[i] + gap
@@ -332,7 +339,8 @@ local function render()
         if focused then
             a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c" .. ACCENT .. "\\1a&H00&}")
         else
-            a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HD8&}")
+            -- Solid dark, with a hairline: never tinted by the picture.
+            a:append("{\\an7\\pos(0,0)\\bord1.5\\shad0\\3c&HFFFFFF&\\3a&HC8&\\1c&H14100E&\\1a&H48&}")
         end
         a:draw_start()
         rect(a, x, by, widths[i], bh, bh / 2)
@@ -635,7 +643,7 @@ end
 
 render_chat = function(a)
     local px, pw, top = 1400, 460, 80
-    local bottom = shown and 800 or 1010
+    local bottom = shown and 740 or 1010
     -- Newest at the bottom: lay out from the end upwards.
     local blocks, y = {}, bottom - 20
     for i = #chat_messages, 1, -1 do
