@@ -54,7 +54,8 @@ enum Msg {
     Quiet,
     Image(String, Option<String>),
     Tools(Result<String, String>),
-    PlaybackDone(yt::Ended),
+    /// A player ended: its number (see `App::player_seq`) and what it saw.
+    PlaybackDone(u64, yt::Ended),
 }
 
 struct App {
@@ -76,6 +77,8 @@ struct App {
     /// Bumped to stop waiting for a sign-in code.
     sign_in_wait: Arc<AtomicU64>,
     player: Option<Child>,
+    /// Counts the players started; only the newest one's end counts.
+    player_seq: u64,
     positions: Vec<(String, f64)>,
     votes: HashMap<String, (u64, u64)>,
     tools: Scan<String>,
@@ -122,6 +125,7 @@ impl App {
             toast: None,
             sign_in_wait: Arc::new(AtomicU64::new(0)),
             player: None,
+            player_seq: 0,
             positions,
             votes: HashMap::new(),
             tools: Scan::Busy,
@@ -461,6 +465,8 @@ impl App {
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
                 self.player = Some(child);
+                self.player_seq += 1;
+                let seq = self.player_seq;
                 let (tx, rctx) = self.jobs.sender();
                 let s = yt::Session {
                     ctx: self.yt_ctx(),
@@ -478,7 +484,7 @@ impl App {
                     queue,
                 };
                 yt::spawn_watcher(tile, s, move |ended| {
-                    let _ = tx.send(Msg::PlaybackDone(ended));
+                    let _ = tx.send(Msg::PlaybackDone(seq, ended));
                     rctx.request_repaint();
                 });
             }
@@ -560,8 +566,12 @@ impl App {
                     }
                 };
             }
-            Msg::PlaybackDone(ended) => {
-                if let Some(mut p) = self.player.take() {
+            Msg::PlaybackDone(seq, ended) => {
+                // An older player (replaced by a newer one): only where it
+                // stopped counts. Its end must not bring CatTube over the
+                // video playing now, or wait for that one to end.
+                let current = seq == self.player_seq;
+                if current && let Some(mut p) = self.player.take() {
                     let _ = p.wait();
                 }
                 for (id, pos, dur) in ended.positions {
@@ -579,6 +589,9 @@ impl App {
                 {
                     self.prefs.speed = sp;
                     self.save_prefs(ctx);
+                }
+                if !current {
+                    return;
                 }
                 if self.quit_after_play {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -768,6 +781,31 @@ enum Start {
 
 /// `--feed`: the newest videos of a list, one per line, for a TV home
 /// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
+/// `--mark-watched ID`: put a video into the signed-in account's history
+/// (watched 30 s), the way playing it does. Says what YouTube answered.
+fn mark_watched(id: &str) -> i32 {
+    let config = cattube_core::env::config_dir();
+    let accounts = account::load(&config);
+    let Some(a) = accounts.active() else {
+        eprintln!("cattube: not signed in");
+        return 2;
+    };
+    let p = prefs::load(&config);
+    let ctx = ytc::context("en", &p.region);
+    match yt::history_start(&ctx, id, &a.refresh_token)
+        .and_then(|(watchtime, cpn)| yt::history_progress(&watchtime, &cpn, 30.0, &a.refresh_token))
+    {
+        Ok(()) => {
+            println!("in your history: {id}");
+            0
+        }
+        Err(e) => {
+            eprintln!("cattube: history: {e}");
+            1
+        }
+    }
+}
+
 fn feed(which: &str) -> i32 {
     let browse = match which {
         "home" | "recommended" => ytc::feeds::HOME,
@@ -878,6 +916,13 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         return Ok(());
+    }
+    if let Some(id) = args
+        .iter()
+        .position(|a| a == "--mark-watched")
+        .and_then(|i| args.get(i + 1))
+    {
+        std::process::exit(mark_watched(id));
     }
     if let Some(i) = args.iter().position(|a| a == "--feed") {
         std::process::exit(feed(
