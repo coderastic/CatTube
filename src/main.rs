@@ -483,7 +483,16 @@ impl App {
                     region: self.prefs.region.clone(),
                     queue,
                 };
+                let (data, quit) = (self.data.clone(), self.quit_after_play);
                 yt::spawn_watcher(tile, s, move |ended| {
+                    // Where it stopped is saved right here: CatTube's window
+                    // may be hidden (behind the TV's own screen), and a hidden
+                    // window handles nothing until it shows again.
+                    save_positions(&data, &ended.positions);
+                    // Opened to play this one video: done, close now.
+                    if quit {
+                        std::process::exit(0);
+                    }
                     let _ = tx.send(Msg::PlaybackDone(seq, ended));
                     rctx.request_repaint();
                 });
@@ -574,14 +583,10 @@ impl App {
                 if current && let Some(mut p) = self.player.take() {
                     let _ = p.wait();
                 }
-                for (id, pos, dur) in ended.positions {
-                    player::remember(&mut self.positions, &id, pos, dur);
+                // Saved already when it ended (save_positions): read back.
+                if let Ok(t) = std::fs::read_to_string(self.data.join("positions.conf")) {
+                    self.positions = player::parse_positions(&t);
                 }
-                let _ = std::fs::create_dir_all(&self.data);
-                let _ = std::fs::write(
-                    self.data.join("positions.conf"),
-                    player::positions_text(&self.positions),
-                );
                 // The speed picked in the player is kept for the next video.
                 if let Some(sp) = ended.speed
                     && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
@@ -781,6 +786,23 @@ enum Start {
 
 /// `--feed`: the newest videos of a list, one per line, for a TV home
 /// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
+/// Add where videos stopped to `positions.conf` (read, merge, write: the
+/// phone-remote service writes it too).
+fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) {
+    if ended.is_empty() {
+        return;
+    }
+    let path = data.join("positions.conf");
+    let mut list = std::fs::read_to_string(&path)
+        .map(|t| player::parse_positions(&t))
+        .unwrap_or_default();
+    for (id, pos, dur) in ended {
+        player::remember(&mut list, id, *pos, *dur);
+    }
+    let _ = std::fs::create_dir_all(data);
+    let _ = std::fs::write(&path, player::positions_text(&list));
+}
+
 /// `--mark-watched ID`: put a video into the signed-in account's history
 /// (watched 30 s), the way playing it does. Says what YouTube answered.
 fn mark_watched(id: &str) -> i32 {
