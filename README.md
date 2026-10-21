@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="packaging/io.github.coderastic.CatTube.svg" width="128" alt="CatTube">
+</p>
+
 # CatTube
 
 A native Linux YouTube app made for TV screens and remotes.
