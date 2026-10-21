@@ -1080,3 +1080,77 @@ mp.observe_property("speed", "number", function(_, sp)
         speed_button.label = "Speed"
     end
 end)
+
+-- Loading: from the moment the player opens (and for each next video)
+-- until its first picture, a spinning arc in the accent colour and the
+-- video's title, instead of a black screen. Also while the video waits
+-- for more data.
+local loading_overlay = mp.create_osd_overlay("ass-events")
+loading_overlay.res_x, loading_overlay.res_y = W, H
+local loading_timer = nil
+local loading_since = mp.get_time()
+
+local function arc_ring(a, cx, cy, r_out, r_in, from, to)
+    local steps = 40
+    a:move_to(cx + r_out * math.cos(from), cy + r_out * math.sin(from))
+    for i = 1, steps do
+        local t = from + (to - from) * i / steps
+        a:line_to(cx + r_out * math.cos(t), cy + r_out * math.sin(t))
+    end
+    for i = steps, 0, -1 do
+        local t = from + (to - from) * i / steps
+        a:line_to(cx + r_in * math.cos(t), cy + r_in * math.sin(t))
+    end
+end
+
+local function draw_loading()
+    local t = mp.get_time() - loading_since
+    local a = assdraw.ass_new()
+    local cx, cy = W / 2, H / 2 - 30
+    -- A faint track, then the arc: it turns, and grows and shrinks.
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HE6&}")
+    a:draw_start()
+    arc_ring(a, cx, cy, 34, 28, 0, 2 * math.pi - 0.001)
+    a:draw_stop()
+    local spin = t * 5.2
+    local len = 1.2 + 1.8 * (0.5 + 0.5 * math.sin(t * 2.6))
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c" .. ACCENT .. "\\1a&H00&}")
+    a:draw_start()
+    arc_ring(a, cx, cy, 34, 28, spin, spin + len)
+    a:draw_stop()
+    local title = mp.get_property("media-title", "") or ""
+    if title:find("^https?://") or title:find("watch%?v=") then title = "" end
+    if title ~= "" then
+        if #title > 90 then title = title:sub(1, 88) .. "…" end
+        title = title:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
+        a:new_event()
+        a:append(string.format("{\\an8\\pos(%d,%d)\\bord0\\shad0\\fs34\\b1\\1c&HFFFFFF&\\1a&H10&}%s", W / 2, cy + 70, title))
+    end
+    loading_overlay.data = a.text
+    loading_overlay:update()
+end
+
+local function loading(on)
+    if on then
+        if not loading_timer then
+            loading_since = mp.get_time()
+            loading_timer = mp.add_periodic_timer(1 / 30, draw_loading)
+        end
+        draw_loading()
+    else
+        if loading_timer then loading_timer:kill(); loading_timer = nil end
+        loading_overlay:remove()
+    end
+end
+
+loading(true)
+mp.register_event("start-file", function() loading(true) end)
+mp.register_event("playback-restart", function()
+    if not mp.get_property_bool("paused-for-cache", false) then loading(false) end
+end)
+mp.register_event("end-file", function() loading(false) end)
+mp.observe_property("paused-for-cache", "bool", function(_, waiting)
+    if waiting then loading(true) elseif mp.get_property("time-pos") then loading(false) end
+end)
