@@ -505,6 +505,18 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
     }
     c.frost_edge(rect, RADIUS, 0.4);
     widgets::focus_sheen(c, rect, RADIUS, focus);
+    // A ring in the accent colour, so the focused card is plain to see
+    // over any picture (the lift alone was easy to miss).
+    if focus > 0.01 {
+        let gap = c.len(4.0);
+        let a = theme::accent();
+        c.outline(
+            rect.expand(gap),
+            RADIUS + 4.0,
+            3.0,
+            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), (255.0 * focus) as u8),
+        );
+    }
     // Title (two lines at most) and channel under the card.
     let ink = if focus > 0.5 {
         theme::text()

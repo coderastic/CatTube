@@ -225,12 +225,28 @@ impl App {
                 self.tube
                     .on_page(&id, Ok(cattube_core::watched::page(&list)));
             }
+            Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
+                self.jobs.spawn(move || {
+                    let r = yt::subscriptions(&yctx, refresh.as_deref());
+                    Msg::Page(id, r)
+                })
+            }
             Effect::Load(id) => self.jobs.spawn(move || {
-                let r = yt::page(&yctx, &id, refresh.as_deref());
+                let mut r = yt::page(&yctx, &id, refresh.as_deref());
+                if id == ytc::feeds::HOME
+                    && let Ok(p) = r.as_mut()
+                {
+                    ytc::tidy_home(p);
+                }
                 Msg::Page(id, r)
             }),
             Effect::LoadMore { browse_id, token } => self.jobs.spawn(move || {
-                let r = yt::more(&yctx, &token, refresh.as_deref());
+                let mut r = yt::more(&yctx, &token, refresh.as_deref());
+                if browse_id == ytc::feeds::HOME
+                    && let Ok(p) = r.as_mut()
+                {
+                    ytc::tidy_home(p);
+                }
                 Msg::More(browse_id, token, r)
             }),
             Effect::Search(q) => {
@@ -876,8 +892,6 @@ enum Start {
     Play(String, String),
 }
 
-/// `--feed`: the newest videos of a list, one per line, for a TV home
-/// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
 /// Closing while a TV home screen started CatTube (CatosTV sets
 /// `CATOSTV_APP_ID` for the apps it opens): ask it to come back first, so
 /// what is behind CatTube's window never shows in between. True when it
@@ -918,11 +932,9 @@ fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) 
     let _ = std::fs::write(&path, player::positions_text(&list));
 }
 
+/// `--feed`: the newest videos of a list, one per line, for a TV home
+/// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
 fn feed(which: &str) -> i32 {
-    let browse = match which {
-        "home" | "recommended" => ytc::feeds::HOME,
-        _ => ytc::feeds::SUBSCRIPTIONS,
-    };
     let config = cattube_core::env::config_dir();
     let accounts = account::load(&config);
     let Some(a) = accounts.active() else {
@@ -930,7 +942,24 @@ fn feed(which: &str) -> i32 {
     };
     let p = prefs::load(&config);
     let ctx = ytc::context("en", &p.region);
-    let page = match yt::page(&ctx, browse, Some(&a.refresh_token)) {
+    let refresh = Some(a.refresh_token.as_str());
+    let page = match which {
+        "home" | "recommended" => yt::page(&ctx, ytc::feeds::HOME, refresh).map(|mut p| {
+            ytc::tidy_home(&mut p);
+            p
+        }),
+        // Every channel's newest uploads, newest first.
+        _ => yt::subscription_feeds(&ctx, refresh).map(|(_, uploads)| ytc::Page {
+            shelves: vec![ytc::Shelf {
+                title: String::new(),
+                tiles: cattube_core::subs::newest(&uploads, 24),
+                continuation: None,
+                more: None,
+            }],
+            ..ytc::Page::default()
+        }),
+    };
+    let page = match page {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cattube: {e}");

@@ -7,6 +7,7 @@ use cattube_core::community;
 use cattube_core::mpv::{self, Arg};
 use cattube_core::player::{self, PlayOptions};
 use cattube_core::process::{Cmd, Runner, SystemRunner};
+use cattube_core::subs;
 use cattube_core::youtube::{self as yt, Details, Page, Rating};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -116,6 +117,49 @@ fn token_request(body: &str) -> Result<cattube_core::process::Output, String> {
     let _ = std::fs::remove_file(&h);
     let _ = std::fs::remove_file(&b);
     out.map_err(|e| e.to_string())
+}
+
+/// Many plain GETs at once in one `curl` (one HTTP/2 connection, in
+/// parallel). Each answer in order; empty when that one failed.
+fn fetch_many(urls: &[String]) -> Vec<String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir =
+        cattube_core::env::runtime_dir().join(format!("cattube-many-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir(&dir).is_err() {
+        return vec![String::new(); urls.len()];
+    }
+    // A curl config file: the addresses stay off the command line.
+    let config: String = urls
+        .iter()
+        .enumerate()
+        .map(|(i, u)| format!("url = \"{u}\"\noutput = \"{}/{i}\"\n", dir.display()))
+        .collect();
+    let list = dir.join("list");
+    if std::fs::write(&list, config).is_ok() {
+        let _ = SystemRunner.run(
+            &Cmd::new("curl")
+                .args([
+                    "-sS".to_string(),
+                    "--compressed".to_string(),
+                    "--fail".to_string(),
+                    "--parallel".to_string(),
+                    "--parallel-max".to_string(),
+                    "40".to_string(),
+                    "-m".to_string(),
+                    "20".to_string(),
+                    "-K".to_string(),
+                    list.display().to_string(),
+                ])
+                .timeout(Duration::from_secs(30)),
+        );
+    }
+    let out = (0..urls.len())
+        .map(|i| std::fs::read_to_string(dir.join(i.to_string())).unwrap_or_default())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
 }
 
 /// One request; the header file is removed afterwards.
@@ -461,6 +505,52 @@ fn comments_json(r: Result<yt::Comments, String>) -> String {
         }
         Err(e) => format!("{{\"error\":{}}}", mpv::json_string(&e)),
     }
+}
+
+/// Subscriptions as a row per channel you follow, the newest first
+/// (`cattube_core::subs`).
+pub fn subscriptions(ctx: &str, refresh: Option<&str>) -> Result<Page, String> {
+    let (channels, uploads) = subscription_feeds(ctx, refresh)?;
+    Ok(subs::rows(&channels, &uploads))
+}
+
+/// The channels you follow, and each one's newest uploads from its public
+/// feed (fetched a dozen at a time).
+pub fn subscription_feeds(
+    ctx: &str,
+    refresh: Option<&str>,
+) -> Result<(Vec<yt::Tile>, Vec<Vec<subs::Upload>>), String> {
+    let mut list = page(ctx, yt::feeds::CHANNELS, refresh)?;
+    let mut channels: Vec<yt::Tile> = Vec::new();
+    for _ in 0..20 {
+        for t in list.tiles() {
+            if t.kind == yt::Kind::Channel
+                && subs::feed_url(&t.id).is_some()
+                && !channels.iter().any(|c| c.id == t.id)
+            {
+                channels.push(t);
+            }
+        }
+        let Some(c) = list.continuation.clone() else {
+            break;
+        };
+        list = more(ctx, &c, refresh)?;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let urls: Vec<String> = channels
+        .iter()
+        .filter_map(|c| subs::feed_url(&c.id))
+        .collect();
+    let uploads: Vec<Vec<subs::Upload>> = fetch_many(&urls)
+        .iter()
+        .map(|xml| subs::parse_feed(xml, now))
+        .collect();
+    if !channels.is_empty() && uploads.iter().all(Vec::is_empty) {
+        return Err("YouTube didn't answer".into());
+    }
+    Ok((channels, uploads))
 }
 
 /// Home, signed out: YouTube's topic channels, fetched side by side.

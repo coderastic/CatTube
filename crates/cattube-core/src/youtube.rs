@@ -811,6 +811,17 @@ pub fn parse_suggestions(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// Home without the rows YouTube adds on its own: "Recommended shows"
+/// (TV series from anywhere, in any language), seasonal promotions ("Your
+/// home for festivities, fashion, and fireworks") and rows of Shorts.
+pub fn tidy_home(p: &mut Page) {
+    p.shelves.retain(|s| {
+        s.title != "Recommended shows"
+            && !s.title.starts_with("Your home for")
+            && !s.tiles.iter().all(|t| t.kind == Kind::Short)
+    });
+}
+
 /// The browse ids of CatTube's sections.
 pub mod feeds {
     pub const HOME: &str = "FEwhat_to_watch";
@@ -1246,5 +1257,34 @@ mod tests {
         );
         assert_eq!(parse_suggestions(r#"["x",["a","b"]]"#), ["a", "b"]);
         assert!(parse_suggestions("<html>").is_empty());
+    }
+
+    #[test]
+    fn home_drops_the_rows_youtube_adds_on_its_own() {
+        let shelf = |title: &str, kind: Kind| Shelf {
+            title: title.into(),
+            tiles: vec![Tile {
+                kind,
+                ..Tile::default()
+            }],
+            continuation: None,
+            more: None,
+        };
+        let mut p = Page {
+            shelves: vec![
+                shelf("Recommended", Kind::Video),
+                shelf("Recommended shows", Kind::Video),
+                shelf(
+                    "Your home for festivities, fashion, and fireworks",
+                    Kind::Video,
+                ),
+                shelf("Shorts", Kind::Short),
+                shelf("Top channels you watch", Kind::Channel),
+            ],
+            ..Page::default()
+        };
+        tidy_home(&mut p);
+        let left: Vec<&str> = p.shelves.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(left, ["Recommended", "Top channels you watch"]);
     }
 }
