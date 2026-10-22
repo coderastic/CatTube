@@ -224,6 +224,10 @@ pub fn mpv_argv(
         "--wayland-app-id=cattube-player",
         "--osc=no",
         "--cache=yes",
+        // YouTube's video addresses only work a few seconds after they are
+        // handed out (yt-dlp's "available_at"); until then they answer
+        // 403. Ask again for up to 12 s instead of giving up.
+        "--stream-lavf-o=reconnect=1,reconnect_on_http_error=403,reconnect_delay_max=12",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -390,6 +394,10 @@ mod tests {
             Path::new("/run/s.sock"),
             Some("deno:/d/deno"),
         );
+        // Waits for YouTube's address to become usable instead of failing.
+        assert!(v.iter().any(
+            |a| a.starts_with("--stream-lavf-o=") && a.contains("reconnect_on_http_error=403")
+        ));
         assert_eq!(
             v.last().unwrap(),
             "https://www.youtube.com/watch?v=WhWc3b3KhnY"
