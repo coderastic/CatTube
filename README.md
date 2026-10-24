@@ -41,17 +41,17 @@ work when your screen and graphics can take them.
 
 ## Install
 
-**Flatpak.** Download `CatTube-1.0.2-x86_64.flatpak` from the
+**Flatpak.** Download `CatTube-1.0.3-x86_64.flatpak` from the
 [releases](https://github.com/coderastic/CatTube/releases), then:
 
 ```sh
-flatpak install --user CatTube-1.0.2-x86_64.flatpak
+flatpak install --user CatTube-1.0.3-x86_64.flatpak
 flatpak run io.github.coderastic.CatTube
 ```
 
 Flatpak fetches the Freedesktop runtime from Flathub if you don't have it.
 
-**AppImage.** Download `CatTube-1.0.2-x86_64.AppImage`, make it executable
+**AppImage.** Download `CatTube-1.0.3-x86_64.AppImage`, make it executable
 and run it. It brings its own mpv; it needs Python 3 and curl, which almost
 every distribution has.
 
