@@ -1114,7 +1114,8 @@ end
 local function draw_loading()
     local t = mp.get_time() - loading_since
     local a = assdraw.ass_new()
-    local cx, cy = W / 2, H / 2 - 30
+    -- Just the spinner, in the middle: no title while it loads.
+    local cx, cy = W / 2, H / 2
     -- A faint track, then the arc: it turns, and grows and shrinks.
     a:new_event()
     a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HE6&}")
@@ -1128,14 +1129,6 @@ local function draw_loading()
     a:draw_start()
     arc_ring(a, cx, cy, 34, 28, spin, spin + len)
     a:draw_stop()
-    local title = mp.get_property("media-title", "") or ""
-    if title:find("^https?://") or title:find("watch%?v=") then title = "" end
-    if title ~= "" then
-        if #title > 90 then title = title:sub(1, 88) .. "…" end
-        title = title:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
-        a:new_event()
-        a:append(string.format("{\\an8\\pos(%d,%d)\\bord0\\shad0\\fs34\\b1\\1c&HFFFFFF&\\1a&H10&}%s", W / 2, cy + 70, title))
-    end
     loading_overlay.data = a.text
     loading_overlay:update()
 end
