@@ -10,6 +10,7 @@
 use crate::canvas::Canvas;
 use crate::icons;
 use crate::images::Images;
+use crate::motion;
 use crate::prefs::Prefs;
 use crate::target::Target;
 use crate::theme::{self, Weight};
@@ -91,6 +92,8 @@ pub struct View<'a> {
     pub votes: &'a HashMap<String, (u64, u64)>,
     pub tools: &'a Scan<String>,
     pub now: f64,
+    /// The video playing behind the browser.
+    pub now_playing: Option<&'a Tile>,
 }
 
 const RADIUS: f32 = 18.0;
@@ -110,7 +113,22 @@ fn ease(c: &C, id: impl std::hash::Hash + std::fmt::Debug, secs: f32) -> f32 {
     1.0 - (1.0 - c.appear(id, secs)).powi(3)
 }
 
+fn content<K: Clone + PartialEq + Send + Sync + 'static>(
+    c: &C,
+    id: &str,
+    key: K,
+    seconds: f32,
+) -> C {
+    let t = c.entrance(id, key, seconds);
+    c.opacity(t).translated(0.0, 14.0 * (1.0 - t))
+}
+
 pub fn draw(c: &C, v: &View) {
+    let menu_id = match v.tube.screen() {
+        Some(Screen::Menu { tile, .. }) => Some(tile.id.clone()),
+        _ => None,
+    };
+    let menu_t = c.entrance("video-menu", menu_id, motion::SHEET);
     match v.tube.screen() {
         Some(Screen::Browse) | None => draw_browse(c, v),
         Some(Screen::Page {
@@ -142,13 +160,62 @@ pub fn draw(c: &C, v: &View) {
             index,
         }) => {
             // The screen underneath stays, dimmed.
-            draw_under(c, v);
-            draw_menu(c, v, tile, details, *index);
+            draw_under(&c.passive(), v);
+            let panel = c.opacity(menu_t).translated(0.0, 14.0 * (1.0 - menu_t));
+            draw_menu(&panel, v, tile, details, *index);
         }
         Some(Screen::SignIn { code }) => draw_sign_in(c, v, code),
         Some(Screen::TvCode { code }) => draw_tv_code(c, v, code),
         Some(Screen::Settings { index, groups }) => draw_settings(c, v, *index, *groups),
     }
+    if matches!(
+        v.tube.screen(),
+        Some(Screen::Browse | Screen::Page { .. } | Screen::Search { .. }) | None
+    ) && let Some(tile) = v.now_playing
+    {
+        now_playing_bar(c, tile, v.tube.now_playing);
+    }
+}
+
+/// Kept below the feed so playback never competes with a video card.
+fn now_playing_bar(c: &C, tile: &Tile, focused: bool) {
+    let k = ease(c, "now-playing", motion::CONTROL);
+    let t = focus_t(c, "now-playing-focus", focused);
+    let y = 632.0 + 14.0 * (1.0 - k);
+    let rect = c.r(64.0, y, 1152.0, 64.0);
+    c.glass(rect, 20.0);
+    widgets::bar_pill(c, rect, 20.0, t);
+    let ink = widgets::mix(theme::text(), theme::on_accent(), t);
+    let sub = widgets::mix(theme::text2(), theme::on_accent(), t);
+    icons::draw(c, "play", 96.0, y + 32.0, 22.0, ink);
+    c.text(
+        124.0,
+        y + 19.0,
+        Align2::LEFT_CENTER,
+        "Now playing",
+        13.0,
+        sub,
+        Weight::Medium,
+    );
+    c.text(
+        124.0,
+        y + 43.0,
+        Align2::LEFT_CENTER,
+        &c.fit(&tile.title, 800.0, 18.0, Weight::Semibold),
+        18.0,
+        ink,
+        Weight::Semibold,
+    );
+    c.text(
+        1188.0,
+        y + 32.0,
+        Align2::RIGHT_CENTER,
+        "Return to video",
+        16.0,
+        ink,
+        Weight::Semibold,
+    );
+    c.hit(rect, Target::NowPlaying);
 }
 
 /// The screen under the video menu.
@@ -179,6 +246,9 @@ fn draw_under(c: &C, v: &View) {
             cols,
         ),
         _ => draw_browse(c, v),
+    }
+    if let Some(tile) = v.now_playing {
+        now_playing_bar(c, tile, false);
     }
     c.fill(c.screen, 0.0, theme::rgba(theme::BLACK, 120));
 }
@@ -456,9 +526,11 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
                 Weight::Semibold,
             );
         }
-    } else if !t.badge.is_empty() {
-        let live = t.kind == Kind::Live || t.badge == "LIVE";
-        let tw = c.text_width(&t.badge, 13.0, Weight::Semibold) + 14.0;
+    } else if !t.badge.is_empty() || v.now_playing.is_some_and(|active| active.id == t.id) {
+        let playing = v.now_playing.is_some_and(|active| active.id == t.id);
+        let badge = if playing { "Playing" } else { &t.badge };
+        let live = !playing && (t.kind == Kind::Live || t.badge == "LIVE");
+        let tw = c.text_width(badge, 13.0, Weight::Semibold) + 14.0;
         let b = c.r(rx + rw - tw - 8.0, ry + rh - 30.0, tw, 22.0);
         c.fill(
             b,
@@ -474,7 +546,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
             bx,
             by,
             Align2::CENTER_CENTER,
-            &t.badge,
+            badge,
             13.0,
             theme::text(),
             Weight::Semibold,
@@ -518,13 +590,9 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
         );
     }
     // Title (two lines at most) and channel under the card.
-    let ink = if focus > 0.5 {
-        theme::text()
-    } else {
-        theme::text2()
-    };
+    let ink = widgets::mix(theme::text2(), theme::text(), focus);
     let (l1, l2) = two_lines(c, &t.title, w, 15.0);
-    let ty = y + h + 12.0 + 8.0 * focus;
+    let ty = y + h + 20.0;
     c.text(x, ty, Align2::LEFT_TOP, &l1, 15.0, ink, Weight::Semibold);
     if !l2.is_empty() {
         c.text(
@@ -642,13 +710,19 @@ fn rows(
     // Just above the focused row's title: the row above leaves no text
     // peeking out under the header.
     let clip_top = top - 8.0;
-    let list = c.clipped(0.0, clip_top, 1280.0, 720.0 - clip_top);
+    let bottom = if v.now_playing.is_some() {
+        608.0
+    } else {
+        720.0
+    };
+    let list = c.clipped(0.0, clip_top, 1280.0, bottom - clip_top);
     for (ri, sh) in p.shelves.iter().enumerate() {
         let y = top + ri as f32 * ROW_H - scroll;
-        if y > 720.0 || y + ROW_H < clip_top {
+        if y + 36.0 >= bottom || y + ROW_H < clip_top {
             continue;
         }
-        let row_focus = focus.is_some_and(|(r, _)| r == ri);
+        let row_focus =
+            !v.tube.now_playing && !v.tube.header && focus.is_some_and(|(r, _)| r == ri);
         let rise = ease(&list, (id, "row-in", ri), 0.3 + 0.08 * ri.min(6) as f32);
         let y = y + 20.0 * (1.0 - rise);
         let tr = list.anim((id, "row-t", ri), if row_focus { 1.0 } else { 0.0 });
@@ -662,7 +736,7 @@ fn rows(
             y,
             Align2::LEFT_TOP,
             title,
-            17.0 + 1.5 * tr,
+            18.0,
             Color32::from_rgba_unmultiplied(
                 theme::INK.0,
                 theme::INK.1,
@@ -685,8 +759,8 @@ fn rows(
             }
             let f = focus_t(&list, (id, "card", ri, ci), row_focus && col == ci);
             card(&list, v, t, x, y + 36.0, CARD_W, CARD_H, f);
-            if hit && y + 36.0 > clip_top && y + 36.0 + CARD_H < 720.0 {
-                c.hit(c.r(x, y + 36.0, CARD_W, CARD_H), Target::Tube(ri, ci));
+            if hit && y + 36.0 > clip_top && y + 36.0 + CARD_H < bottom {
+                list.hit(list.r(x, y + 36.0, CARD_W, CARD_H), Target::Tube(ri, ci));
             }
         }
     }
@@ -718,10 +792,21 @@ fn failed(c: &C, e: &str, y: f32) {
 
 fn draw_browse(c: &C, v: &View) {
     let t = v.tube;
-    let focused = t.focused();
+    let focused = if t.now_playing {
+        v.now_playing.cloned()
+    } else {
+        t.focused()
+    };
     backdrop(c, v, focused.as_ref());
     header(c, v, t.header.then_some(t.header_index));
     let section = t.section;
+    let layer = content(
+        c,
+        "browse-content",
+        (section, matches!(t.current(), Some(Scan::Done(_)))),
+        motion::PAGE,
+    );
+    let c = &layer;
     if section.needs_sign_in() && v.accounts.active().is_none() {
         message(
             c,
@@ -736,7 +821,7 @@ fn draw_browse(c: &C, v: &View) {
             if let Some(f) = &focused {
                 hero(c, f, 64.0, 112.0, 760.0);
             }
-            let focus = (!t.header).then_some((t.row, t.cols.as_slice()));
+            let focus = Some((t.row, t.cols.as_slice()));
             rows(c, v, p, focus, 300.0, "browse", true);
         }
         Some(Scan::Done(_)) => {
@@ -762,7 +847,11 @@ fn tools_note(c: &C, v: &View) {
         widgets::busy_line(
             c,
             64.0,
-            690.0,
+            if v.now_playing.is_some() {
+                610.0
+            } else {
+                690.0
+            },
             "Getting the player ready (first start)…",
             true,
             v.now,
@@ -798,7 +887,15 @@ fn draw_page(c: &C, v: &View, page: &Scan<Page>, row: usize, cols: &[usize]) {
         let sh = p.shelves.get(row)?;
         sh.tiles.get(cols.get(row).copied().unwrap_or(0)).cloned()
     });
+    let focused = if v.tube.now_playing {
+        v.now_playing.cloned()
+    } else {
+        focused
+    };
     backdrop(c, v, focused.as_ref());
+    let page_key = page.items().first().map(|p| p.title.clone());
+    let layer = content(c, "channel-content", page_key, motion::PAGE);
+    let c = &layer;
     let k = ease(c, "tube-page-in", 0.35);
     mark(c, 52.0, 52.0, 26.0, (255.0 * k) as u8);
     match page {
@@ -854,6 +951,20 @@ fn draw_search(
         },
     );
     header(c, v, on_header.then_some(v.tube.header_index));
+    let layer = content(
+        c,
+        "search-content",
+        (
+            in_results,
+            if in_results {
+                osk.text().to_string()
+            } else {
+                String::new()
+            },
+        ),
+        motion::PAGE,
+    );
+    let c = &layer;
     if in_results {
         // What was searched, as a quiet field centred under the top bar
         // (Up from the first row goes back to it), then the channels and a
@@ -875,15 +986,7 @@ fn draw_search(
             Weight::Medium,
         );
         if let Some(p) = results.items().first() {
-            rows(
-                c,
-                v,
-                p,
-                (!on_header).then_some((row, cols)),
-                168.0,
-                "search",
-                true,
-            );
+            rows(c, v, p, Some((row, cols)), 168.0, "search", true);
         }
         return;
     }
@@ -895,7 +998,7 @@ fn draw_search(
         104.0,
         640.0,
         "Search YouTube",
-        suggestion.is_none() && !on_header,
+        suggestion.is_none() && !on_header && !v.tube.now_playing,
         "tube-osk",
         &Target::Key,
     );
@@ -915,7 +1018,11 @@ fn draw_search(
     }
     for (i, s) in suggestions.iter().enumerate().take(7) {
         let y = 118.0 + i as f32 * 50.0;
-        let t = focus_t(c, ("tube-sugg", i), suggestion == Some(i) && !on_header);
+        let t = focus_t(
+            c,
+            ("tube-sugg", i),
+            suggestion == Some(i) && !on_header && !v.tube.now_playing,
+        );
         let r = c.r(x, y, 456.0, 42.0);
         c.hit(r, Target::Suggestion(i));
         if t > 0.01 {

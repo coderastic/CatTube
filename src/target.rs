@@ -8,4 +8,6 @@ pub enum Target {
     Key(usize, usize),
     /// A search suggestion.
     Suggestion(usize),
+    /// The Now playing bar.
+    NowPlaying,
 }

@@ -78,6 +78,15 @@ The first time it starts, CatTube downloads its own copy of
 | Hold OK, F2 | the video's menu | |
 | Back, Esc | back | hide the controls, then stop |
 
+## Shared casting switch
+
+On CatosTV, the Cast to this TV switch also controls CatTube's paired-phone
+connection. Turning it off closes phone casting and blocks new pairing;
+local browsing and playback remain available. Standalone installations keep
+the usual phone controls. Other host shells can set
+`CATTUBE_CAST_ENABLED_FILE` to a preference file containing
+`cast_enabled = true` or `cast_enabled = false`; changes apply while running.
+
 ## Command line
 
 | Option | What it does |

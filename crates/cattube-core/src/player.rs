@@ -198,6 +198,9 @@ pub struct PlayOptions {
     pub subs_on: bool,
     /// `RRGGBB` for the control bar.
     pub accent: String,
+    /// Back hides the video (it plays on behind CatTube's list) instead
+    /// of stopping it: on CatosTV, which can bring it back.
+    pub hide_on_back: bool,
 }
 
 /// mpv's command line for a video. `data` holds yt-dlp, `ui` the control
@@ -259,6 +262,13 @@ pub fn mpv_argv(
     if accent.len() == 6 {
         opts.push(format!("cattube_osd-accent={accent}"));
     }
+    if o.hide_on_back {
+        opts.push("cattube_osd-hide=yes".to_string());
+    }
+    opts.push(format!(
+        "cattube_osd-position_dir={}",
+        data.join("positions").display()
+    ));
     v.push(format!("--script-opts={}", opts.join(",")));
     v.push(format!(
         "--ytdl-format={}",
@@ -303,8 +313,8 @@ pub fn mpv_argv(
     if !title.trim().is_empty() {
         v.push(format!("--force-media-title={title}"));
     }
-    if o.start > 3.0 {
-        v.push(format!("--start={:.0}", o.start));
+    if o.start.is_finite() && o.start > 0.0 {
+        v.push(format!("--start={:.3}", o.start));
     }
     v.push("--osd-duration=1500".into());
     v.push("--osd-bar-align-y=0.86".into());
@@ -333,11 +343,10 @@ pub fn parse_positions(text: &str) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Remember `pos` for `id` (nearly finished = forgotten: it starts over).
-pub fn remember(list: &mut Vec<(String, f64)>, id: &str, pos: f64, duration: Option<f64>) {
+/// Preserve partial playback, including short videos and their final seconds.
+pub fn remember(list: &mut Vec<(String, f64)>, id: &str, pos: f64, _duration: Option<f64>) {
     list.retain(|(x, _)| x != id);
-    let finished = duration.is_some_and(|d| d - pos < 30.0 || pos / d > 0.95);
-    if pos > 10.0 && !finished {
+    if pos.is_finite() && pos > 0.0 {
         list.push((id.to_string(), pos));
     }
     let n = list.len();
@@ -348,8 +357,109 @@ pub fn remember(list: &mut Vec<(String, f64)>, id: &str, pos: f64, duration: Opt
 
 pub fn positions_text(list: &[(String, f64)]) -> String {
     list.iter()
-        .map(|(id, s)| format!("{id} {s:.0}\n"))
+        .map(|(id, s)| format!("{id} {s:.3}\n"))
         .collect()
+}
+
+pub fn position_clock(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Written atomically by the player itself, including on pause, seek and exit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Checkpoint {
+    pub position: f64,
+    pub duration: Option<f64>,
+    pub finished: bool,
+}
+
+pub fn store_checkpoint(data: &Path, id: &str, point: Checkpoint) -> std::io::Result<()> {
+    if !crate::youtube::is_video_id(id) || !point.position.is_finite() || point.position < 0.0 {
+        return Err(std::io::Error::other("invalid playback position"));
+    }
+    let folder = data.join("positions");
+    std::fs::create_dir_all(&folder)?;
+    let path = folder.join(format!("{id}.pos"));
+    let tmp = folder.join(format!("{id}.{}.tmp", std::process::id()));
+    std::fs::write(
+        &tmp,
+        format!(
+            "{:.3} {:.3} {}\n",
+            point.position,
+            point.duration.unwrap_or(0.0),
+            u8::from(point.finished)
+        ),
+    )?;
+    std::fs::rename(tmp, path)
+}
+
+pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
+    if !crate::youtube::is_video_id(id) {
+        return None;
+    }
+    let text = std::fs::read_to_string(data.join("positions").join(format!("{id}.pos"))).ok()?;
+    let mut fields = text.split_whitespace();
+    let position: f64 = fields.next()?.parse().ok()?;
+    let duration: f64 = fields.next()?.parse().ok()?;
+    let finished = match fields.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    if !position.is_finite() || position < 0.0 || !duration.is_finite() {
+        return None;
+    }
+    Some(Checkpoint {
+        position,
+        duration: (duration > 0.0).then_some(duration),
+        finished,
+    })
+}
+
+/// Player checkpoints take precedence over the older watcher snapshots.
+pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
+    let mut list = std::fs::read_to_string(data.join("positions.conf"))
+        .map(|s| parse_positions(&s))
+        .unwrap_or_default();
+    let mut files: Vec<_> = std::fs::read_dir(data.join("positions"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()?.to_str()? != "pos" {
+                return None;
+            }
+            let id = path.file_stem()?.to_str()?.to_string();
+            if !crate::youtube::is_video_id(&id) {
+                return None;
+            }
+            Some((entry.metadata().ok()?.modified().ok()?, id, path))
+        })
+        .collect();
+    files.sort_by_key(|f| f.0);
+    let stale = files.len().saturating_sub(MAX_POSITIONS);
+    for (_, _, path) in files.drain(..stale) {
+        let _ = std::fs::remove_file(path);
+    }
+    for (_, id, _) in files {
+        if let Some(point) = checkpoint(data, &id) {
+            if point.finished {
+                list.retain(|(video, _)| *video != id);
+            } else {
+                remember(&mut list, &id, point.position, point.duration);
+            }
+        }
+    }
+    if list.len() > MAX_POSITIONS {
+        list.drain(..list.len() - MAX_POSITIONS);
+    }
+    list
 }
 
 #[cfg(test)]
@@ -386,6 +496,7 @@ mod tests {
             sub_langs: "en".into(),
             subs_on: false,
             accent: "7c6cf0".into(),
+            hide_on_back: false,
         };
         let v = mpv_argv(
             &o,
@@ -402,18 +513,30 @@ mod tests {
             v.last().unwrap(),
             "https://www.youtube.com/watch?v=WhWc3b3KhnY"
         );
-        assert!(v.contains(&"--start=61".to_string()));
+        assert!(v.contains(&"--start=61.400".to_string()));
+        let mut short = o.clone();
+        short.start = 0.5;
+        assert!(
+            mpv_argv(
+                &short,
+                Path::new("/d"),
+                Path::new("/ui"),
+                Path::new("/sock"),
+                None
+            )
+            .contains(&"--start=0.500".to_string())
+        );
         assert!(v.contains(&"--resume-playback=no".to_string()));
         assert!(v.contains(&"--speed=1.5".to_string()));
         assert!(v.contains(&"--force-media-title=Spring".to_string()));
-        assert!(v.contains(&"--script-opts=ytdl_hook-ytdl_path=/d/yt-dlp,ytdl_hook-try_ytdl_first=yes,cattube_osd-accent=7c6cf0".to_string()));
+        assert!(v.contains(&"--script-opts=ytdl_hook-ytdl_path=/d/yt-dlp,ytdl_hook-try_ytdl_first=yes,cattube_osd-accent=7c6cf0,cattube_osd-position_dir=/d/positions".to_string()));
         assert!(v.contains(&"--ytdl-raw-options=js-runtimes=deno:/d/deno,sub-langs=\"en,en-(?-i:[A-Z]).*,en-orig\",write-subs=,write-auto-subs=".to_string()));
         assert!(v.contains(&"--sid=no".to_string()));
         assert!(v.contains(&"--demuxer-max-bytes=256MiB".to_string()));
         assert!(v.contains(&"--input-ipc-server=/run/s.sock".to_string()));
-        // A position at the very start is not passed.
+        // Zero starts normally; every positive saved position is passed.
         let o2 = PlayOptions {
-            start: 2.0,
+            start: 0.0,
             sub_langs: String::new(),
             ..o
         };
@@ -450,9 +573,47 @@ mod tests {
         assert_eq!(l.len(), 2);
         remember(&mut l, "WhWc3b3KhnY", 200.0, Some(1000.0));
         assert_eq!(l.last().unwrap(), &("WhWc3b3KhnY".to_string(), 200.0));
-        // Watched to the end: forgotten.
+        // Stopping near the end still keeps the unwatched final seconds.
         remember(&mut l, "B4EPW7JUMTM", 990.0, Some(1000.0));
-        assert!(!l.iter().any(|(i, _)| i == "B4EPW7JUMTM"));
-        assert_eq!(positions_text(&l), "WhWc3b3KhnY 200\n");
+        assert!(l.iter().any(|(i, p)| i == "B4EPW7JUMTM" && *p == 990.0));
+        assert_eq!(
+            positions_text(&l),
+            "WhWc3b3KhnY 200.000\nB4EPW7JUMTM 990.000\n"
+        );
+    }
+    #[test]
+    fn exact_player_checkpoint_wins_over_delayed_watcher_save() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-positions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("positions")).unwrap();
+        std::fs::write(
+            root.join("positions.conf"),
+            "WhWc3b3KhnY 100\nB4EPW7JUMTM 900\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("positions/WhWc3b3KhnY.pos"),
+            "123.456 130.000 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("positions/B4EPW7JUMTM.pos"),
+            "1000.000 1000.000 1\n",
+        )
+        .unwrap();
+        let loaded = load_positions(&root);
+        assert_eq!(loaded, vec![("WhWc3b3KhnY".into(), 123.456)]);
+        assert_eq!(parse_positions(&positions_text(&loaded)), loaded);
+        std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "0.500 20.000 0\n").unwrap();
+        assert_eq!(load_positions(&root), vec![("WhWc3b3KhnY".into(), 0.5)]);
+        std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "NaN 20 0\n").unwrap();
+        assert!(checkpoint(&root, "WhWc3b3KhnY").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

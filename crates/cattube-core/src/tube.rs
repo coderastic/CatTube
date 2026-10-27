@@ -305,6 +305,8 @@ pub enum Effect {
     Setting(SettingRow, i32),
     Close,
     Toast(String),
+    /// Back to the video playing behind (the Now playing bar).
+    ShowPlayer,
 }
 
 /// What the app knows that the screens need.
@@ -313,6 +315,8 @@ pub struct Ctx {
     pub signed_in: bool,
     pub accounts: usize,
     pub sponsorblock: bool,
+    /// A video plays behind CatTube's list (Back in the player hid it).
+    pub playing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +331,8 @@ pub struct Tube {
     pub header: bool,
     /// Which pill has focus in the header: a tab, or `ALL.len()` = account.
     pub header_index: usize,
+    /// The Now playing bar has focus (only while `Ctx::playing`).
+    pub now_playing: bool,
     pub error: Option<String>,
     /// What was searched lately, newest first: shown in Search while the
     /// box is empty.
@@ -357,6 +363,7 @@ impl Tube {
             cols: Vec::new(),
             header: false,
             header_index: 0,
+            now_playing: false,
             error: None,
             recent: Vec::new(),
         };
@@ -372,14 +379,15 @@ impl Tube {
 
     /// Typing goes to a keyboard.
     pub fn text_mode(&self) -> bool {
-        matches!(
-            self.stack.last(),
-            Some(Screen::Search {
-                in_results: false,
-                suggestion: None,
-                ..
-            })
-        )
+        !self.now_playing
+            && matches!(
+                self.stack.last(),
+                Some(Screen::Search {
+                    in_results: false,
+                    suggestion: None,
+                    ..
+                })
+            )
     }
 
     /// The page the Browse screen shows.
@@ -440,6 +448,13 @@ impl Tube {
             },
             ctx,
         )
+    }
+
+    /// The Browse tab on screen has rows of videos.
+    fn has_rows(&self) -> bool {
+        self.current()
+            .and_then(|p| p.items().first())
+            .is_some_and(|p| !p.shelves.is_empty())
     }
 
     fn back(&mut self) -> Vec<Effect> {
@@ -520,6 +535,47 @@ impl Tube {
         ctx: Ctx,
         resumable: &dyn Fn(&str) -> bool,
     ) -> Vec<Effect> {
+        // The pinned player strip owns focus until Up returns to browsing.
+        if self.now_playing {
+            if !ctx.playing {
+                self.now_playing = false;
+            } else {
+                match action {
+                    Action::Ok | Action::OkLong | Action::Back => return vec![Effect::ShowPlayer],
+                    Action::Up => {
+                        self.now_playing = false;
+                        self.header =
+                            matches!(self.screen(), Some(Screen::Browse)) && !self.has_rows();
+                    }
+                    _ => {}
+                }
+                return vec![];
+            }
+        }
+        if ctx.playing {
+            let bottom = match self.screen() {
+                Some(Screen::Browse) if !self.header => self
+                    .current()
+                    .and_then(|p| p.items().first())
+                    .map(|p| (p, self.row)),
+                Some(Screen::Page { page, row, .. }) => page.items().first().map(|p| (p, *row)),
+                Some(Screen::Search {
+                    results,
+                    row,
+                    in_results: true,
+                    ..
+                }) if !self.header => results.items().first().map(|p| (p, *row)),
+                _ => None,
+            }
+            .is_some_and(|(p, row)| row + 1 >= p.shelves.len() && p.continuation.is_none());
+            if (action == Action::Down && bottom)
+                || (action == Action::Back && self.stack.len() == 1)
+            {
+                self.now_playing = true;
+                self.header = false;
+                return vec![];
+            }
+        }
         // The top bar over Search (Up from the search field).
         if self.header && matches!(self.stack.last(), Some(Screen::Search { .. })) {
             return self.handle_search_header(action, ctx);
@@ -855,12 +911,11 @@ impl Tube {
                 Action::Left => self.header_index = self.header_index.saturating_sub(1),
                 Action::Right => self.header_index = (self.header_index + 1).min(n_tabs),
                 Action::Down => {
-                    let has_rows = self
-                        .current()
-                        .and_then(|p| p.items().first())
-                        .is_some_and(|p| !p.shelves.is_empty());
-                    if has_rows {
+                    if self.has_rows() {
                         self.header = false;
+                    } else if ctx.playing {
+                        self.header = false;
+                        self.now_playing = true;
                     }
                 }
                 Action::Ok | Action::OkLong => {
@@ -884,6 +939,11 @@ impl Tube {
                             .is_some_and(|p| !p.shelves.is_empty());
                     }
                     return eff;
+                }
+                // Back past the tabs: to the bar, not out of CatTube.
+                Action::Back if ctx.playing && self.stack.len() == 1 => {
+                    self.header = false;
+                    self.now_playing = true;
                 }
                 Action::Back => return self.back(),
                 _ => {}
@@ -972,9 +1032,48 @@ impl Tube {
         {
             let empty = scan.items().first().is_none_or(|p| p.shelves.is_empty());
             self.pages.insert(browse_id.to_string(), scan);
-            if self.section.browse_id() == Some(browse_id) && empty {
+            if self.section.browse_id() == Some(browse_id) && empty && !self.now_playing {
                 self.header = true;
             }
+        }
+    }
+
+    /// Background refreshes keep the selected video in place.
+    pub fn replace_page(&mut self, browse_id: &str, result: Result<Page, String>) {
+        let active = self.section.browse_id() == Some(browse_id);
+        let selected = active
+            .then(|| {
+                self.current()
+                    .and_then(|p| p.items().first())
+                    .and_then(|p| tile_at(p, self.row, &self.cols))
+            })
+            .flatten()
+            .map(|t| t.id);
+        self.on_page(browse_id, result);
+        if active && let Some(page) = self.current().and_then(|p| p.items().first()) {
+            let found = selected.and_then(|id| {
+                page.shelves.iter().enumerate().find_map(|(row, s)| {
+                    s.tiles
+                        .iter()
+                        .position(|t| t.id == id)
+                        .map(|col| (row, col))
+                })
+            });
+            let row = found
+                .map_or(self.row, |(r, _)| r)
+                .min(page.shelves.len().saturating_sub(1));
+            let col = found
+                .map_or(self.cols.get(row).copied().unwrap_or(0), |(_, c)| c)
+                .min(
+                    page.shelves
+                        .get(row)
+                        .map_or(0, |s| s.tiles.len().saturating_sub(1)),
+                );
+            self.row = row;
+            if self.cols.len() <= row {
+                self.cols.resize(row + 1, 0);
+            }
+            self.cols[row] = col;
         }
     }
 
@@ -1340,11 +1439,17 @@ mod tests {
         signed_in: false,
         accounts: 0,
         sponsorblock: true,
+        playing: false,
     };
     const IN: Ctx = Ctx {
         signed_in: true,
         accounts: 1,
         sponsorblock: true,
+        playing: false,
+    };
+    const PLAYING: Ctx = Ctx {
+        playing: true,
+        ..IN
     };
     fn no(_: &str) -> bool {
         false
@@ -1377,6 +1482,86 @@ mod tests {
         t.handle(Up, IN, &no);
         assert!(t.header);
         assert_eq!(t.handle(Back, IN, &no), vec![Effect::Close]);
+    }
+
+    #[test]
+    fn the_now_playing_bar_goes_back_to_the_video() {
+        let (mut t, _) = Tube::open(IN);
+        t.on_page("FEwhat_to_watch", ok(page(&[&["aaaaaaaaaaa"]])));
+        // The video was hidden: the bar has focus, OK goes back to it.
+        t.now_playing = true;
+        assert_eq!(t.handle(Ok, PLAYING, &no), vec![Effect::ShowPlayer]);
+        // Up restores the previous row, Down from the last row returns.
+        t.handle(Up, PLAYING, &no);
+        assert!(!t.now_playing && !t.header);
+        assert_eq!(t.focused().unwrap().id, "aaaaaaaaaaa");
+        t.handle(Down, PLAYING, &no);
+        assert!(t.now_playing);
+        // The header and feed stay next to each other, above the player.
+        t.handle(Up, PLAYING, &no);
+        t.handle(Up, PLAYING, &no);
+        assert!(t.header && !t.now_playing);
+        t.handle(Down, PLAYING, &no);
+        assert!(!t.now_playing && !t.header);
+        assert_eq!(t.handle(Back, PLAYING, &no), vec![]);
+        assert!(t.now_playing);
+        assert_eq!(t.handle(Back, PLAYING, &no), vec![Effect::ShowPlayer]);
+        // The video ended: the bar is gone, keys work as before.
+        t.handle(Down, IN, &no);
+        assert!(!t.now_playing);
+    }
+
+    #[test]
+    fn player_strip_preserves_channel_focus_and_search_pagination() {
+        let (mut t, _) = Tube::open(IN);
+        t.open_page("UCchannel".into());
+        t.on_page("UCchannel", ok(page(&[&["a", "b"], &["c", "d"]])));
+        t.handle(Down, PLAYING, &no);
+        t.handle(Right, PLAYING, &no);
+        t.handle(Down, PLAYING, &no);
+        assert!(t.now_playing);
+        assert_eq!(t.handle(Ok, PLAYING, &no), vec![Effect::ShowPlayer]);
+        t.handle(Up, PLAYING, &no);
+        assert!(!t.now_playing);
+        assert_eq!(t.focused().unwrap().id, "d");
+        t.select(Section::Search, IN);
+        let mut reply = page(&[&["a", "b"]]);
+        reply.continuation = Some("next".into());
+        t.on_search(ok(reply));
+        if let Some(Screen::Search { in_results, .. }) = t.stack.last_mut() {
+            *in_results = true;
+        }
+        assert_eq!(
+            t.handle(Down, PLAYING, &no),
+            vec![Effect::SearchMore("next".into())]
+        );
+        assert!(!t.now_playing);
+        if let Some(Screen::Search { in_results, .. }) = t.stack.last_mut() {
+            *in_results = false;
+        }
+        assert!(t.text_mode());
+        t.now_playing = true;
+        assert!(!t.text_mode());
+        assert_eq!(t.handle(Back, PLAYING, &no), vec![Effect::ShowPlayer]);
+    }
+
+    #[test]
+    fn refreshed_history_preserves_the_selected_video() {
+        let (mut t, _) = Tube::open(IN);
+        t.on_page("FEwhat_to_watch", ok(page(&[&["a", "b", "c"]])));
+        t.handle(Right, IN, &no);
+        t.replace_page("FEwhat_to_watch", ok(page(&[&["new", "a", "b", "c"]])));
+        assert_eq!(t.focused().unwrap().id, "b");
+        t.open_page("UCchannel".into());
+        t.replace_page(
+            "FEwhat_to_watch",
+            ok(page(&[&["newer", "new", "a", "b", "c"]])),
+        );
+        t.handle(Back, IN, &no);
+        assert_eq!(t.focused().unwrap().id, "b");
+        t.now_playing = true;
+        t.replace_page("FEwhat_to_watch", ok(Page::default()));
+        assert!(!t.header && t.now_playing);
     }
 
     #[test]

@@ -199,7 +199,7 @@ pub fn video_thumb(id: &str) -> String {
     format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")
 }
 
-fn is_video_id(s: &str) -> bool {
+pub fn is_video_id(s: &str) -> bool {
     s.len() == 11
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')

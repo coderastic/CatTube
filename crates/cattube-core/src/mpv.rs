@@ -438,9 +438,13 @@ impl IpcConn {
 
     /// Send a command and wait (≤ [`IPC_TIMEOUT`]) for its reply.
     pub fn command(&mut self, args: &[Arg]) -> Result<Json> {
+        self.command_with_timeout(args, IPC_TIMEOUT)
+    }
+
+    pub fn command_with_timeout(&mut self, args: &[Arg], timeout: Duration) -> Result<Json> {
         let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         self.writer.write_all(command_line(args, id).as_bytes())?;
-        let deadline = Instant::now() + IPC_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         while !self.eof {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -464,9 +468,15 @@ impl IpcConn {
         Err(Error::msg("player did not answer"))
     }
 
-    /// Script messages received so far (and any arriving within `wait`).
+    /// Wait while idle, then return an input burst without delaying its action.
     pub fn messages(&mut self, wait: Duration) -> Vec<Vec<String>> {
-        let deadline = Instant::now() + wait;
+        let burst = Duration::from_millis(1);
+        let mut deadline = Instant::now()
+            + if self.messages.is_empty() {
+                wait
+            } else {
+                wait.min(burst)
+            };
         while !self.eof {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -476,6 +486,9 @@ impl IpcConn {
                 Some(line) => {
                     if parse_reply(&line).is_none() {
                         self.keep_event(&line);
+                        if !self.messages.is_empty() {
+                            deadline = deadline.min(Instant::now() + burst);
+                        }
                     }
                 }
                 None => break,
@@ -618,6 +631,38 @@ mod tests {
     }
 
     #[test]
+    fn player_input_wakes_the_watcher_without_waiting_out_its_poll() {
+        let (a, mut peer) = UnixStream::pair().unwrap();
+        let mut conn = IpcConn::from_stream(a).unwrap();
+        writeln!(
+            peer,
+            r#"{{"event":"client-message","args":["cattube-hide"]}}"#
+        )
+        .unwrap();
+        let at = Instant::now();
+        assert_eq!(
+            conn.messages(Duration::from_secs(1)),
+            vec![vec!["cattube-hide".to_string()]]
+        );
+        assert!(at.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn short_command_deadline_does_not_wait_for_the_default_timeout() {
+        let (a, _peer) = UnixStream::pair().unwrap();
+        let mut conn = IpcConn::from_stream(a).unwrap();
+        let at = Instant::now();
+        assert!(
+            conn.command_with_timeout(
+                &[Arg::Str("get_property"), Arg::Str("time-pos")],
+                Duration::from_millis(20)
+            )
+            .is_err()
+        );
+        assert!(at.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
     fn ipc_conn_keeps_script_messages_between_replies() {
         let (a, b) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
@@ -649,7 +694,10 @@ mod tests {
         });
         let mut c = IpcConn::from_stream(a).unwrap();
         assert_eq!(c.get_f64("time-pos"), Some(12.5));
-        let got = c.messages(Duration::from_millis(300));
+        let mut got = c.messages(Duration::from_millis(300));
+        if got.len() < 2 {
+            got.extend(c.messages(Duration::from_millis(300)));
+        }
         assert_eq!(
             got,
             vec![

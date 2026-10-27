@@ -10,6 +10,7 @@ mod icons;
 mod images;
 mod jobs;
 mod keys;
+mod motion;
 mod pointer;
 mod prefs;
 mod remote;
@@ -40,8 +41,8 @@ use target::Target;
 enum Msg {
     Page(String, Result<Page, String>),
     More(String, String, Result<Page, String>),
-    Search(Result<Page, String>),
-    SearchMore(Result<Page, String>),
+    Search(u64, String, Result<Page, String>),
+    SearchMore(u64, Result<Page, String>),
     Suggestions(String, Vec<String>),
     Details(String, Result<Details, String>),
     Votes(String, Option<(u64, u64)>),
@@ -56,6 +57,9 @@ enum Msg {
     Tools(Result<String, String>),
     /// A player ended: its number (see `App::player_seq`) and what it saw.
     PlaybackDone(u64, yt::Ended),
+    /// That player's current video was hidden behind the browser.
+    PlayerHidden(u64, Tile),
+    PlayerChanged(u64, Tile),
 }
 
 struct App {
@@ -83,6 +87,8 @@ struct App {
     player: Option<Child>,
     /// Counts the players started; only the newest one's end counts.
     player_seq: u64,
+    /// The current video, retained while browsing and returning to playback.
+    now_playing: Option<Tile>,
     positions: Vec<(String, f64)>,
     votes: HashMap<String, (u64, u64)>,
     tools: Scan<String>,
@@ -91,6 +97,8 @@ struct App {
     /// When the phone code on screen was asked for (a new one every 4 min).
     tv_code_at: Option<Instant>,
     was_focused: bool,
+    search_generation: u64,
+    search_query: String,
 }
 
 impl App {
@@ -102,13 +110,12 @@ impl App {
         let prefs = prefs::load(&config);
         theme::set_accent(&prefs.accent);
         let accounts = account::load(&config);
-        let positions = std::fs::read_to_string(data.join("positions.conf"))
-            .map(|t| player::parse_positions(&t))
-            .unwrap_or_default();
+        let positions = player::load_positions(&data);
         let ctx = Ctx {
             signed_in: accounts.active().is_some(),
             accounts: accounts.list.len(),
             sponsorblock: prefs.sponsorblock,
+            playing: false,
         };
         let (mut tube, mut effects) = Tube::open(ctx);
         tube.recent = std::fs::read_to_string(data.join("searches.txt"))
@@ -142,11 +149,14 @@ impl App {
             sign_in_wait: Arc::new(AtomicU64::new(0)),
             player: None,
             player_seq: 0,
+            now_playing: None,
             positions,
             votes: HashMap::new(),
             tools: Scan::Busy,
             quit_after_play: false,
             was_focused: true,
+            search_generation: 0,
+            search_query: String::new(),
             tv_code_at: None,
         };
         app.jobs.spawn(move || Msg::Tools(yt::ensure_tools(&data)));
@@ -180,6 +190,7 @@ impl App {
             signed_in: self.accounts.active().is_some(),
             accounts: self.accounts.list.len(),
             sponsorblock: self.prefs.sponsorblock,
+            playing: self.now_playing.is_some() && self.player.is_some(),
         }
     }
 
@@ -221,9 +232,31 @@ impl App {
         match e {
             // History is what was watched here.
             Effect::Load(id) if id == ytc::feeds::HISTORY => {
-                let list = self.watched();
+                self.positions = player::load_positions(&self.data);
+                let mut list = self.watched();
+                for tile in &mut list {
+                    if let Some(point) = player::checkpoint(&self.data, &tile.id) {
+                        tile.progress = if point.finished {
+                            Some(1.0)
+                        } else {
+                            point
+                                .duration
+                                .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
+                        };
+                        tile.meta = if point.finished {
+                            "Watched".into()
+                        } else {
+                            format!("Resume at {}", player::position_clock(point.position))
+                        };
+                        if tile.badge.is_empty()
+                            && let Some(d) = point.duration
+                        {
+                            tile.badge = player::position_clock(d);
+                        }
+                    }
+                }
                 self.tube
-                    .on_page(&id, Ok(cattube_core::watched::page(&list)));
+                    .replace_page(&id, Ok(cattube_core::watched::page(&list)));
             }
             Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
                 self.jobs.spawn(move || {
@@ -260,12 +293,20 @@ impl App {
                     .collect();
                 let _ = std::fs::create_dir_all(&self.data);
                 let _ = std::fs::write(self.data.join("searches.txt"), list);
-                self.jobs
-                    .spawn(move || Msg::Search(yt::search(&yctx, &q, refresh.as_deref())))
+                self.search_generation += 1;
+                self.search_query = q.clone();
+                let generation = self.search_generation;
+                self.jobs.spawn(move || {
+                    let result = yt::search(&yctx, &q, refresh.as_deref());
+                    Msg::Search(generation, q, result)
+                })
             }
-            Effect::SearchMore(t) => self
-                .jobs
-                .spawn(move || Msg::SearchMore(yt::search_more(&yctx, &t, refresh.as_deref()))),
+            Effect::SearchMore(t) => {
+                let generation = self.search_generation;
+                self.jobs.spawn(move || {
+                    Msg::SearchMore(generation, yt::search_more(&yctx, &t, refresh.as_deref()))
+                })
+            }
             Effect::Suggest(q) => self.jobs.spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 let s = yt::suggestions(&q);
@@ -401,6 +442,7 @@ impl App {
                     // draws nothing and so would never act on a close
                     // request: end here (the player goes with it).
                     if let Some(mut p) = self.player.take() {
+                        yt::checkpoint_player(&self.data);
                         let _ = p.kill();
                         let _ = p.wait();
                     }
@@ -409,6 +451,13 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close)
             }
             Effect::Toast(t) => self.toast(ctx, &t),
+            Effect::ShowPlayer => {
+                if yt::raise_window(yt::PLAYER_WINDOW) {
+                    self.tube.now_playing = false;
+                } else {
+                    self.toast(ctx, "Could not go back to the video");
+                }
+            }
         }
     }
 
@@ -509,14 +558,19 @@ impl App {
     }
 
     fn play(&mut self, ctx: &egui::Context, tile: Tile, from_start: bool, queue: Vec<Tile>) {
-        let mut list = self.watched();
-        cattube_core::watched::remember(&mut list, &tile);
-        let _ = std::fs::create_dir_all(&self.data);
-        let _ = std::fs::write(
-            self.data.join("watched.conf"),
-            cattube_core::watched::to_text(&list),
-        );
+        if !from_start
+            && self.player.is_some()
+            && self
+                .now_playing
+                .as_ref()
+                .is_some_and(|active| active.id == tile.id)
+        {
+            self.effect(ctx, Effect::ShowPlayer);
+            return;
+        }
+        self.positions = player::load_positions(&self.data);
         if let Some(mut old) = self.player.take() {
+            yt::checkpoint_player(&self.data);
             let _ = old.kill();
             let _ = old.wait();
         }
@@ -538,6 +592,7 @@ impl App {
             subs_on: self.prefs.subs_on,
             accent: format!("{r:02x}{g:02x}{b:02x}"),
             buffer_mib: self.prefs.buffer,
+            hide_on_back: on_catostv() && !self.quit_after_play,
         };
         if !player::yt_dlp_path(&self.data).is_file() {
             return self.toast(ctx, "Getting the player ready, try again in a moment");
@@ -547,7 +602,11 @@ impl App {
                 self.player = Some(child);
                 self.player_seq += 1;
                 let seq = self.player_seq;
+                self.now_playing = None;
+                self.tube.now_playing = false;
                 let (tx, rctx) = self.jobs.sender();
+                let (htx, hctx) = self.jobs.sender();
+                let (vtx, vctx) = self.jobs.sender();
                 let s = yt::Session {
                     ctx: self.yt_ctx(),
                     refresh: self.refresh(),
@@ -561,6 +620,14 @@ impl App {
                     hdr: self.prefs.hdr,
                     region: self.prefs.region.clone(),
                     queue,
+                    on_video: Some(Box::new(move |tile| {
+                        let _ = vtx.send(Msg::PlayerChanged(seq, tile));
+                        vctx.request_repaint();
+                    })),
+                    on_hide: Some(Box::new(move |title| {
+                        let _ = htx.send(Msg::PlayerHidden(seq, title));
+                        hctx.request_repaint();
+                    })),
                 };
                 let (data, quit) = (self.data.clone(), self.quit_after_play);
                 yt::spawn_watcher(tile, s, move |ended| {
@@ -584,14 +651,27 @@ impl App {
     fn message(&mut self, ctx: &egui::Context, msg: Msg) {
         let c = self.ctx();
         match msg {
-            Msg::Page(id, r) => self.tube.on_page(&id, r),
+            Msg::Page(id, r) => self.tube.replace_page(&id, r),
             Msg::More(id, tok, r) => {
                 if let Ok(p) = r {
                     self.tube.on_more(&id, &tok, p);
                 }
             }
-            Msg::Search(r) => self.tube.on_search(r),
-            Msg::SearchMore(r) => self.tube.on_search_more(r),
+            Msg::Search(generation, query, r) => {
+                if search_matches(&self.tube, self.search_generation, generation, &query) {
+                    self.tube.on_search(r);
+                }
+            }
+            Msg::SearchMore(generation, r) => {
+                if search_matches(
+                    &self.tube,
+                    self.search_generation,
+                    generation,
+                    &self.search_query,
+                ) {
+                    self.tube.on_search_more(r);
+                }
+            }
             Msg::Suggestions(q, s) => self.tube.on_suggestions(&q, s),
             Msg::Details(id, r) => self.tube.on_details(&id, r),
             Msg::Votes(id, v) => {
@@ -655,6 +735,26 @@ impl App {
                     }
                 };
             }
+            Msg::PlayerChanged(seq, tile) => {
+                if seq == self.player_seq && self.player.is_some() {
+                    self.now_playing = Some(tile);
+                    if self.tube.section == Section::History && keys::window_focused(ctx) {
+                        self.effect(ctx, Effect::Load(ytc::feeds::HISTORY.to_string()));
+                    }
+                }
+            }
+            Msg::PlayerHidden(seq, tile) => {
+                if seq == self.player_seq && self.player.is_some() {
+                    self.positions = player::load_positions(&self.data);
+                    self.now_playing = Some(tile);
+                    // Focus on the bar: OK goes straight back.
+                    self.tube.now_playing = true;
+                    self.tube.header = false;
+                    if self.tube.section == Section::History {
+                        self.effect(ctx, Effect::Load(ytc::feeds::HISTORY.to_string()));
+                    }
+                }
+            }
             Msg::PlaybackDone(seq, ended) => {
                 // An older player (replaced by a newer one): only where it
                 // stopped counts. Its end must not bring CatTube over the
@@ -662,11 +762,11 @@ impl App {
                 let current = seq == self.player_seq;
                 if current && let Some(mut p) = self.player.take() {
                     let _ = p.wait();
+                    self.now_playing = None;
+                    self.tube.now_playing = false;
                 }
                 // Saved already when it ended (save_positions): read back.
-                if let Ok(t) = std::fs::read_to_string(self.data.join("positions.conf")) {
-                    self.positions = player::parse_positions(&t);
-                }
+                self.positions = player::load_positions(&self.data);
                 // The speed picked in the player is kept for the next video.
                 if let Some(sp) = ended.speed
                     && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
@@ -682,15 +782,13 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                // Fresh History and progress after watching.
+                // Fresh progress must not steal focus from another window.
                 if matches!(
                     self.tube.section,
                     Section::History | Section::Home | Section::Subscriptions
-                ) {
-                    for e in self.tube.reload(c) {
-                        self.effect(ctx, e);
-                    }
+                ) && let Some(id) = self.tube.section.browse_id()
+                {
+                    self.effect(ctx, Effect::Load(id.to_string()));
                 }
             }
         }
@@ -734,6 +832,11 @@ impl App {
                 )
             )
     }
+}
+
+fn search_matches(tube: &Tube, current: u64, received: u64, query: &str) -> bool {
+    current == received
+        && matches!(tube.screen(), Some(Screen::Search { osk, .. }) if osk.text().trim() == query.trim())
 }
 
 fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
@@ -784,8 +887,19 @@ impl eframe::App for App {
         }
         // The pointer focuses what it is over; a click is OK on it.
         let point = |tube: &mut Tube, t: Option<Target>| match t {
-            Some(Target::Tube(r, col)) => ui::tube::focus(tube, r, col),
-            Some(t @ (Target::Key(..) | Target::Suggestion(_))) => ui::tube::focus_search(tube, t),
+            Some(Target::Tube(r, col)) => {
+                tube.now_playing = false;
+                ui::tube::focus(tube, r, col)
+            }
+            Some(t @ (Target::Key(..) | Target::Suggestion(_))) => {
+                tube.now_playing = false;
+                ui::tube::focus_search(tube, t)
+            }
+            Some(Target::NowPlaying) => {
+                tube.header = false;
+                tube.now_playing = true;
+                true
+            }
             _ => false,
         };
         // Only a pointer that really moves picks things: the window opening
@@ -839,6 +953,7 @@ impl eframe::App for App {
             votes: &self.votes,
             tools: &self.tools,
             now,
+            now_playing: self.now_playing.as_ref().filter(|_| self.player.is_some()),
         };
         ui::tube::draw(&canvas, &view);
         let at = Instant::now();
@@ -877,6 +992,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.sign_in_wait.fetch_add(1, Ordering::SeqCst);
         if let Some(mut p) = self.player.take() {
+            yt::checkpoint_player(&self.data);
             let _ = p.kill();
             let _ = p.wait();
         }
@@ -896,6 +1012,11 @@ enum Start {
 /// `CATOSTV_APP_ID` for the apps it opens): ask it to come back first, so
 /// what is behind CatTube's window never shows in between. True when it
 /// did.
+/// Opened by CatosTV, which can put windows in front (`catostv-ctl`).
+fn on_catostv() -> bool {
+    std::env::var_os("CATOSTV_APP_ID").is_some()
+}
+
 fn hand_back_screen() -> bool {
     if std::env::var_os("CATOSTV_APP_ID").is_none() {
         return false;
@@ -1091,7 +1212,7 @@ fn main() -> eframe::Result {
     let (renderer, explicit) = renderer();
     let viewport = egui::ViewportBuilder::default()
         .with_title("CatTube")
-        .with_app_id("io.github.coderastic.CatTube")
+        .with_app_id(yt::APP_WINDOW)
         .with_decorations(windowed)
         .with_fullscreen(!windowed)
         .with_inner_size([1280.0, 720.0]);
@@ -1120,4 +1241,28 @@ fn main() -> eframe::Result {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_replies_follow_the_current_query_and_request() {
+        let (mut tube, _) = Tube::open(Ctx::default());
+        tube.header = true;
+        tube.header_index = Section::ALL
+            .iter()
+            .position(|s| *s == Section::Search)
+            .unwrap();
+        tube.handle(Action::Ok, Ctx::default(), &|_| false);
+        if let Some(Screen::Search { osk, .. }) = tube.stack.last_mut() {
+            osk.set_text("new query");
+        }
+        assert!(search_matches(&tube, 2, 2, "new query"));
+        assert!(!search_matches(&tube, 2, 1, "new query"));
+        assert!(!search_matches(&tube, 2, 2, "old query"));
+        tube.stack.pop();
+        assert!(!search_matches(&tube, 2, 2, "new query"));
+    }
 }

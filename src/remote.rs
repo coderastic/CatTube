@@ -30,6 +30,30 @@ fn log(text: &str) {
     eprintln!("cattube-remote: {text}");
 }
 
+fn casting_allowed(text: &str) -> bool {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .rfind(|(key, _)| key.trim() == "cast_enabled")
+        .is_none_or(|(_, value)| value.trim().trim_matches('"') != "false")
+}
+
+/// A host shell may share its casting switch with CatTube. Elsewhere the
+/// phone remote keeps its usual independent behaviour.
+fn casting_enabled() -> bool {
+    let path = std::env::var_os("CATTUBE_CAST_ENABLED_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            (std::env::var("CATOSTV_APPLIANCE").as_deref() == Ok("1")).then(|| {
+                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(".config/catostv/ui.conf")
+            })
+        });
+    path.is_none_or(|path| match std::fs::read_to_string(path) {
+        Ok(text) => casting_allowed(&text),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    })
+}
+
 fn random(n: usize) -> String {
     cattube_core::util::random_hex(n).unwrap_or_else(|_| format!("{:x}", now_ms()))
 }
@@ -177,6 +201,9 @@ fn token(screen: &Screen) -> Result<Token, String> {
 /// The code to type in the phone's YouTube app (Settings → "Link with TV
 /// code"); good for about five minutes.
 pub fn tv_code(config: &Path) -> Result<String, String> {
+    if !casting_enabled() {
+        return Err("Casting is turned off in the TV's settings".into());
+    }
     let s = screen(config)?;
     let t = token(&s)?;
     let (status, body) = request(
@@ -190,6 +217,9 @@ pub fn tv_code(config: &Path) -> Result<String, String> {
 
 /// Pair the phone that cast to this TV (DIAL's `pairingCode`).
 pub fn register(config: &Path, code: &str) -> Result<(), String> {
+    if !casting_enabled() {
+        return Err("Casting is turned off in the TV's settings".into());
+    }
     let s = screen(config)?;
     let body = lounge::register_code_body(&s, code).ok_or("That pairing code is not valid")?;
     match request(&lounge::register_code_url(), Some(&body)) {
@@ -231,7 +261,7 @@ fn running() -> bool {
 /// time a phone is linked, and it keeps running after CatTube closes).
 pub fn ensure_running() {
     use std::os::unix::process::CommandExt;
-    if running() {
+    if !casting_enabled() || running() {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -257,32 +287,28 @@ enum Event {
     Ended(u64, yt::Ended),
 }
 
-fn listen(url: String, round: u64, tx: Sender<Event>) {
+fn listen(url: String, round: u64, tx: Sender<Event>) -> Option<Child> {
+    // Keep the child with the service so disabling casting can close a
+    // quiet long-poll connection immediately.
+    let mut child = spawn_curl(&url, None, 330, true).ok()?;
+    let out = child.stdout.take()?;
     std::thread::spawn(move || {
-        // YouTube ends a listen after a few minutes; then it is reopened.
-        let Ok(mut child) = spawn_curl(&url, None, 330, true) else {
-            let _ = tx.send(Event::Closed(round, 0));
-            return;
-        };
         let mut status = 0;
-        if let Some(out) = child.stdout.take() {
-            let mut chunks = lounge::Chunks::default();
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                if let Some(s) = line.strip_prefix(STATUS) {
-                    status = s.trim().parse().unwrap_or(0);
-                    continue;
-                }
-                let msgs = chunks.push_line(&line);
-                if !msgs.is_empty() && tx.send(Event::Msgs(round, msgs)).is_err() {
-                    let _ = child.kill();
-                    break;
-                }
+        let mut chunks = lounge::Chunks::default();
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if let Some(s) = line.strip_prefix(STATUS) {
+                status = s.trim().parse().unwrap_or(0);
+                continue;
+            }
+            let msgs = chunks.push_line(&line);
+            if !msgs.is_empty() && tx.send(Event::Msgs(round, msgs)).is_err() {
+                break;
             }
         }
-        let _ = child.wait();
         let _ = tx.send(Event::Closed(round, status));
     });
+    Some(child)
 }
 
 struct Player {
@@ -312,6 +338,7 @@ struct Remote {
     reported: Option<Playing>,
     reported_at: Instant,
     volume: (u32, bool),
+    listener: Option<Child>,
 }
 
 impl Remote {
@@ -328,6 +355,9 @@ impl Remote {
 
     /// Open a session (a new token first when needed). Err: wait and retry.
     fn connect(&mut self) -> Result<(), String> {
+        if !casting_enabled() {
+            return Err("Casting is turned off".into());
+        }
         if self
             .token
             .as_ref()
@@ -341,6 +371,9 @@ impl Remote {
             .map(|t| t.token.clone())
             .unwrap_or_default();
         self.bind.token = t;
+        if !casting_enabled() {
+            return Err("Casting is turned off".into());
+        }
         let url = self.bind.init_url(&self.screen, &random(6));
         let (status, body) = request(&url, Some(lounge::INIT_BODY));
         if status != 200 {
@@ -362,9 +395,33 @@ impl Remote {
     }
 
     fn relisten(&mut self) {
-        if let Some(url) = self.bind.listen_url(&self.screen, &random(6)) {
-            listen(url, self.round, self.tx.clone());
+        self.stop_listening();
+        if !casting_enabled() {
+            return;
         }
+        if let Some(url) = self.bind.listen_url(&self.screen, &random(6)) {
+            self.listener = listen(url, self.round, self.tx.clone());
+            if self.listener.is_none() {
+                let _ = self.tx.send(Event::Closed(self.round, 0));
+            }
+        }
+    }
+
+    fn stop_listening(&mut self) {
+        if let Some(mut child) = self.listener.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn disable_casting(&mut self) {
+        self.stop_listening();
+        self.round += 1;
+        self.bind = Bind::new("", 0);
+        self.token = None;
+        self.queue = Queue::default();
+        self.close_player();
+        self.reported = None;
     }
 
     fn handle(&mut self, msgs: &[Msg]) {
@@ -391,6 +448,9 @@ impl Remote {
     }
 
     fn command(&mut self, c: Command) {
+        if !casting_enabled() {
+            return;
+        }
         match c {
             Command::SetPlaylist { queue, start } => {
                 self.queue = queue;
@@ -462,6 +522,7 @@ impl Remote {
 
     fn close_player(&mut self) {
         if let Some(mut p) = self.player.take() {
+            yt::checkpoint_player(&player::data_home());
             if let Some(c) = p.conn.as_mut() {
                 let _ = c.command(&[Arg::Str("quit")]);
             }
@@ -481,6 +542,9 @@ impl Remote {
     /// Play the queue's current video from `start` (on the TV screen,
     /// over whatever is there; CatTube's own player closes first).
     fn play(&mut self, start: f64) {
+        if !casting_enabled() {
+            return;
+        }
         let Some(id) = self.queue.current().map(str::to_string) else {
             return self.stop();
         };
@@ -501,9 +565,14 @@ impl Remote {
             subs_on: p.subs_on,
             accent: format!("{r:02x}{g:02x}{b:02x}"),
             buffer_mib: p.buffer,
+            // Played from the phone: nothing of CatTube's to go back to.
+            hide_on_back: false,
         };
         if let Err(e) = yt::ensure_tools(&self.data) {
             log(&format!("player not ready: {e}"));
+            return;
+        }
+        if !casting_enabled() {
             return;
         }
         let child = match yt::start_player(&o, &self.data) {
@@ -524,6 +593,8 @@ impl Remote {
             hdr: p.hdr,
             region: p.region.clone(),
             queue: Vec::new(),
+            on_hide: None,
+            on_video: None,
         };
         let tile = ytc::Tile {
             id: id.clone(),
@@ -579,6 +650,7 @@ impl Remote {
             return; // an older player that was replaced
         }
         if let Some(mut p) = self.player.take() {
+            yt::checkpoint_player(&player::data_home());
             let _ = p.child.wait();
         }
         if finished && self.queue.has_next() {
@@ -700,6 +772,10 @@ pub fn run() -> i32 {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
     let mut wait = Duration::from_secs(5);
     let screen = loop {
+        if !casting_enabled() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
         match screen(&config) {
             Ok(s) => break s,
             Err(e) => {
@@ -726,10 +802,23 @@ pub fn run() -> i32 {
         reported: None,
         reported_at: Instant::now(),
         volume: (100, false),
+        listener: None,
     };
     let mut retry_at: Option<Instant> = Some(Instant::now());
     let mut wait = Duration::from_secs(5);
+    let mut enabled = true;
     loop {
+        if !casting_enabled() {
+            if enabled {
+                r.disable_casting();
+                retry_at = Some(Instant::now());
+                wait = Duration::from_secs(5);
+                enabled = false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        enabled = true;
         if let Some(at) = retry_at
             && Instant::now() >= at
         {
@@ -771,6 +860,19 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_casting_switch_ignores_other_settings_and_keeps_the_last_choice() {
+        assert!(casting_allowed(""));
+        assert!(casting_allowed("cast_enabled = true\n"));
+        assert!(casting_allowed("# cast_enabled = false\n"));
+        assert!(casting_allowed("cast_enabled = junk\n"));
+        assert!(!casting_allowed("theme = flat\ncast_enabled = false\n"));
+        assert!(!casting_allowed("cast_enabled = \"false\"\n"));
+        assert!(casting_allowed(
+            "cast_enabled = false\ncast_enabled = true\n"
+        ));
+    }
 
     #[test]
     fn curl_config_quotes() {

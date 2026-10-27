@@ -60,7 +60,7 @@ pub fn focus_pill<H: Copy>(c: &Canvas<H>, rect: Rect, radius: f32, t: f32) {
 /// Colour between `a` and `b` (t = 0 → a, 1 → b).
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    Color32::from_rgba_unmultiplied(
+    Color32::from_rgba_premultiplied(
         lerp(a.r(), b.r(), t),
         lerp(a.g(), b.g(), t),
         lerp(a.b(), b.b(), t),
@@ -780,4 +780,18 @@ pub fn title<H: Copy>(c: &Canvas<H>, x: f32, y: f32, text: &str, size: f32) {
         theme::text(),
         Weight::Semibold,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_colors_preserve_translucent_endpoints() {
+        let quiet = Color32::from_rgba_unmultiplied(255, 255, 255, 160);
+        let focused = Color32::WHITE;
+        assert_eq!(mix(quiet, focused, 0.0), quiet);
+        assert_eq!(mix(quiet, focused, 1.0), focused);
+        assert_eq!(mix(quiet, quiet, 0.5), quiet);
+    }
 }

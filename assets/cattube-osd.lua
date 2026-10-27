@@ -2,9 +2,15 @@
 -- controls, OK again pauses, like a normal TV player. Loaded by CatTube
 -- with --script.
 --
---   controls hidden:  OK / Up / Down  show the controls (Pause focused)
+--   controls hidden:  OK / Up         show the controls (Pause focused)
+--                     Down            show controls, then browse related
+--                                     videos below: arrows move, OK plays,
+--                                     Up from the first row returns to
+--                                     controls, Back returns to the video
 --                     Left / Right    scrub 10 s back / forward
---                     Back            stop
+--                     Back            stop (on CatosTV: back to CatTube's
+--                                     list, the video plays on behind;
+--                                     --script-opts=cattube_osd-hide=yes)
 --   controls shown:   Left / Right    move over the buttons: Previous /
 --                                     Next video on the left (when there
 --                                     is one), −10 s / Pause / +10 s in the
@@ -34,9 +40,40 @@
 local mp = require "mp"
 local options = require "mp.options"
 local assdraw = require "mp.assdraw"
+local utils = require "mp.utils"
 
-local opts = { accent = "7c6cf0", subs = "" }
+local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "" }
 options.read_options(opts, "cattube_osd")
+
+-- The player owns its last position. Watcher/network delays cannot lose it.
+local current_video = ""
+local last_point = nil
+local saved_at = -10
+local function checkpoint(force, finished)
+    if opts.position_dir == "" then return end
+    local at = mp.get_time()
+    if not force and at - saved_at < 2 then return end
+    local path = mp.get_property("path", "")
+    local id = path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or current_video
+    if #id ~= 11 or id:find("[^%w_-]") then return end
+    local pos = mp.get_property_number("time-pos")
+    local dur = mp.get_property_number("duration", 0)
+    if pos and pos >= 0 and pos < math.huge then
+        local ended = finished or (last_point and last_point.id == id and last_point.finished)
+        last_point = {id=id, pos=pos, dur=dur or 0, finished=ended}
+    elseif not last_point or last_point.id ~= id then
+        return
+    elseif finished then
+        last_point.finished = true
+    end
+    local point = last_point
+    local target = opts.position_dir .. "/" .. point.id .. ".pos"
+    local f = io.open(target .. ".tmp", "w")
+    if not f then return end
+    local ok = f:write(string.format("%.3f %.3f %d\n", point.pos, point.dur, point.finished and 1 or 0))
+    f:close()
+    if ok then os.rename(target .. ".tmp", target); saved_at = at end
+end
 
 -- Names for external subtitle tracks, in the order they were added.
 local sub_names = {}
@@ -65,6 +102,7 @@ local toggle_chat -- likewise
 local chat_on = false -- a live video's chat shows on the right
 
 local function episode(which)
+    checkpoint(true, false)
     mp.commandv("script-message", "cattube-episode", which)
 end
 
@@ -146,21 +184,33 @@ local function text_width(label, size)
     return #label * size * 0.52
 end
 
-local render_menu, render_card, render_chat -- below
+local render_menu, render_card, render_chat, render_related, render_volume -- below
+local vol = nil
+local related = nil -- related browser: { items, index, loading, request }
 
 -- Everything drawn goes through here, so the Up next card is drawn
 -- over whatever else shows.
 local function set_osd(text)
     -- The chat goes under everything else, and steps aside for a menu.
-    if chat_on and render_chat and not menu then
+    if chat_on and render_chat and not menu and not related then
         local c = assdraw.ass_new()
         render_chat(c)
         text = c.text .. (text ~= "" and ("\n" .. text) or "")
+    end
+    if related and render_related then
+        local c = assdraw.ass_new()
+        render_related(c)
+        text = (text ~= "" and (text .. "\n") or "") .. c.text
     end
     if card then
         local c = assdraw.ass_new()
         render_card(c)
         text = (text ~= "" and (text .. "\n") or "") .. c.text
+    end
+    if vol and render_volume then
+        local a = assdraw.ass_new()
+        render_volume(a)
+        text = (text ~= "" and (text .. "\n") or "") .. a.text
     end
     mp.set_osd_ass(W, H, text)
 end
@@ -480,7 +530,7 @@ end
 
 -- A video's comments, fetched by CatTube page by page ("cattube-comments
 -- first|<token>" → "cattube-comments-data <json>").
-local utils = require "mp.utils"
+
 local comments = { path = nil, items = {}, more = "", loading = false, error = nil }
 
 local function comments_request(arg)
@@ -761,6 +811,147 @@ local function fit(t, size, width)
     return t
 end
 
+render_volume = function(a)
+    local flat = vol.style == "flat"
+    local accent = vol.accent or ACCENT
+    local w, h = 96, 420
+    local x, y = W - 42 - w, 330
+    local cx = x + w / 2
+    a:new_event()
+    a:append(flat and "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H242424&\\1a&H00&}"
+        or "{\\an7\\pos(0,0)\\bord3\\shad0\\1c&H101018&\\1a&H28&\\3c&HFFFFFF&\\3a&H69&}")
+    a:draw_start()
+    rect(a, x, y, w, h, w / 2)
+    a:draw_stop()
+    -- Mute: lit while muted.
+    local my = y + 54
+    a:new_event()
+    if vol.muted then
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c" .. accent .. "\\1a&H00&}")
+    else
+        a:append(flat and "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H343434&\\1a&H00&}" or "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HED&}")
+    end
+    a:draw_start()
+    rect(a, cx - 33, my - 33, 66, 66, 33)
+    a:draw_stop()
+    -- A speaker; struck through while muted.
+    local ink = vol.muted and "101018" or "FFFFFF"
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H" .. ink .. "&\\1a&H00&}")
+    a:draw_start()
+    a:move_to(cx - 15, my - 7)
+    a:line_to(cx - 7, my - 7)
+    a:line_to(cx + 3, my - 15)
+    a:line_to(cx + 3, my + 15)
+    a:line_to(cx - 7, my + 7)
+    a:line_to(cx - 15, my + 7)
+    if vol.muted then
+        a:move_to(cx + 7, my - 9)
+        a:line_to(cx + 10, my - 9)
+        a:line_to(cx + 19, my + 9)
+        a:line_to(cx + 16, my + 9)
+    else
+        rect(a, cx + 8, my - 7, 4, 14, 2)
+        rect(a, cx + 15, my - 12, 4, 24, 2)
+    end
+    a:draw_stop()
+    -- The level.
+    local tw, ty, th = 42, y + 105, 240
+    a:new_event()
+    a:append(flat and "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H505050&\\1a&H00&}" or "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HE9&}")
+    a:draw_start()
+    rect(a, cx - tw / 2, ty, tw, th, tw / 2)
+    a:draw_stop()
+    if vol.pct > 0 then
+        local fh = math.max(th * math.min(vol.pct, 100) / 100, tw)
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c" ..
+            (vol.muted and "&H8C8C8C&" or accent) .. "\\1a&H00&}")
+        a:draw_start()
+        rect(a, cx - tw / 2, ty + th - fh, tw, fh, tw / 2)
+        a:draw_stop()
+    end
+    a:new_event()
+    a:append(string.format("{\\an5\\pos(%d,%d)\\bord0\\shad0\\fs26\\b1\\1c&H%s&\\1a&H00&}%d",
+        cx, y + h - 39, vol.muted and "8C8C8C" or "FFFFFF", vol.pct))
+    -- The output.
+    if vol.output ~= "" then
+        local name = fit(clean(vol.output), 22, 340)
+        local cw = (vol.more and 76 or 48) + text_width(name, 22)
+        local left = x - 18 - cw
+        local ly = y + h - 37
+        a:new_event()
+        a:append(flat and "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H242424&\\1a&H00&}" or "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H101018&\\1a&H28&}")
+        a:draw_start()
+        rect(a, left, y + h - 75, cw, 75, 37)
+        a:draw_stop()
+        local tx = left + 26
+        if vol.more then
+            a:new_event()
+            a:append(string.format("{\\an4\\pos(%.1f,%.1f)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H70&}‹", tx, ly))
+            tx = tx + 30
+        end
+        a:new_event()
+        a:append(string.format("{\\an4\\pos(%.1f,%.1f)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H30&}%s", tx, ly, name))
+    end
+end
+
+
+local vol_timer = nil
+local function vol_hide()
+    if vol_timer then vol_timer:kill(); vol_timer = nil end
+    vol = nil
+    render()
+end
+
+local function vol_arm()
+    if vol_timer then vol_timer:kill() end
+    vol_timer = mp.add_timeout(3, vol_hide)
+end
+
+local function volume_message(pct, muted, output, more, style, accent)
+    vol = {
+        pct = math.floor(math.max(0, math.min(100, tonumber(pct) or 0)) + 0.5),
+        style = style or "glassy",
+        accent = accent and ass_rgb(accent) or ACCENT,
+        muted = muted == "yes",
+        output = output or "",
+        more = more == "yes",
+    }
+    vol_arm()
+    render()
+end
+mp.register_script_message("catfyn-volume", volume_message)
+mp.register_script_message("catostv-volume", volume_message)
+mp.set_property("user-data/catostv/volume-osd", "yes")
+
+-- The shell changes the volume (and answers with `catfyn-volume`).
+local function ctl(cmd)
+    mp.command_native_async({ name = "subprocess", args = { "catostv-ctl", cmd },
+        playback_only = false }, function() end)
+end
+
+-- A key while the volume panel shows: it is the panel's.
+local function vol_key(k)
+    if k == "up" then
+        ctl("volume-up")
+    elseif k == "down" then
+        ctl("volume-down")
+    elseif k == "ok" then
+        ctl("mute")
+    elseif k == "left" then
+        if vol.more then
+            vol_hide()
+            ctl("volume-outputs")
+        end
+        return
+    elseif k == "back" then
+        vol_hide()
+        return
+    end
+    vol_arm()
+end
+
 local function pill(a, x, y, w, h, label, focused)
     a:new_event()
     if focused then
@@ -852,6 +1043,9 @@ mp.register_script_message("cattube-card", function(cmd, a1, a2, a3, a4, a5)
             thumb = { path = a3, w = tonumber(a4), h = tonumber(a5) }
         end
         card = { kind = "next", label = a1, left = tonumber(a2) or 0, focus = 1, thumb = thumb }
+        thumb_at = nil
+    elseif cmd == "thumb" and card and a1 and tonumber(a2) and tonumber(a3) then
+        card.thumb = {path=a1, w=tonumber(a2), h=tonumber(a3)}
         thumb_at = nil
     elseif cmd == "count" and card then
         card.left = tonumber(a1) or card.left
@@ -948,9 +1142,248 @@ local function show()
     arm_hide()
 end
 
+
+-- Related videos sit below the playback controls. Playback continues while
+-- the viewer browses; only OK changes the video.
+local RW, RH, RGAP, RX = 390, 219, 40, 120
+local RCOLS, RROWS, RY, RSTEP = 4, 2, 400, 320
+local RELATED_OVERLAY = 20
+local related_placed = nil
+local related_request = 0
+local related_timer = nil
+local related_scroll, related_target = 0, 0
+local related_at = 0
+local pan = {value=0, speed=0, target=0}
+local fx = {value=0, speed=0, target=0}
+local fy = {value=0, speed=0, target=0}
+
+-- An already running browser may start a player while an update is installed.
+local legacy_placed = {}
+local function legacy_overlays(items)
+    local dims = mp.get_property_native("osd-dimensions") or {}
+    local sx, sy = (dims.w or W) / W, (dims.h or H) / H
+    local first = math.floor(related_scroll) * RCOLS
+    for slot=0,11 do
+        local item = items and items[first+slot+1]
+        local key=nil
+        if item and item.p and item.p~="" and (item.w or 0)>0 then
+            local x=math.floor((RX+slot%RCOLS*(RW+RGAP))*sx)
+            local y=math.floor((RY+(math.floor((first+slot)/RCOLS)-related_scroll)*RSTEP)*sy)
+            local top,bottom=math.floor(RY*sy),math.floor((H-40)*sy)
+            local crop=math.max(0,top-y)
+            local height=math.min(item.h-crop,bottom-math.max(y,top))
+            if height>0 then
+                key=table.concat({item.p,x,math.max(y,top),crop,height}," ")
+                if key~=legacy_placed[slot] then
+                    mp.commandv("overlay-add",21+slot,x,math.max(y,top),item.p,crop*item.w*4,"bgra",item.w,height,item.w*4)
+                end
+            end
+        end
+        if not key and legacy_placed[slot] then mp.commandv("overlay-remove",21+slot) end
+        legacy_placed[slot]=key
+    end
+end
+
+local function related_overlays(atlas)
+    legacy_overlays(related and related.legacy and related.items or nil)
+    if not atlas or not atlas.p or atlas.p == "" then
+        if related_placed then mp.commandv("overlay-remove", RELATED_OVERLAY); related_placed = nil end
+        return
+    end
+    local dims = mp.get_property_native("osd-dimensions") or {}
+    local sx, sy = (dims.w or W) / W, (dims.h or H) / H
+    local offset_y = math.floor(related_scroll * RSTEP + 0.5)
+    local height = math.min(H - 40 - RY, atlas.h - offset_y)
+    if height <= 0 then return end
+    local x, y = math.floor(RX * sx), math.floor(RY * sy)
+    local dw, dh = math.floor(atlas.w * sx), math.floor(height * sy)
+    local offset = offset_y * atlas.w * 4
+    local key = table.concat({atlas.p, atlas.v or 0, x, y, offset, height, dw, dh}, " ")
+    if key ~= related_placed then
+        mp.commandv("overlay-add", RELATED_OVERLAY, x, y, atlas.p, offset,
+            "bgra", atlas.w, height, atlas.w * 4, dw, dh)
+        related_placed = key
+    end
+end
+
+local function advance(s, dt, tolerance)
+    local omega = 26
+    local d = s.value - s.target
+    local c = s.speed + omega * d
+    local decay = math.exp(-omega * dt)
+    s.value = s.target + (d + c * dt) * decay
+    s.speed = (s.speed - omega * c * dt) * decay
+    if math.abs(s.value - s.target) < tolerance and math.abs(s.speed) < tolerance * 10 then
+        s.value, s.speed = s.target, 0
+        return false
+    end
+    return true
+end
+
+local function related_move()
+    local row = math.floor((related.index - 1) / RCOLS)
+    local first = related_target
+    if row < first then first = row end
+    if row >= first + RROWS then first = row - RROWS + 1 end
+    related_target = first
+    pan.target = first
+    fx.target = (related.index - 1) % RCOLS * (RW + RGAP)
+    fy.target = row * RSTEP
+    if related_timer then return end
+    if math.abs(pan.value - pan.target) < 0.0004
+        and math.abs(fx.value - fx.target) < 0.2 and math.abs(fy.value - fy.target) < 0.2 then return end
+    related_at = mp.get_time()
+    related_timer = mp.add_periodic_timer(related.legacy and 1 / 30 or 1 / 60, function()
+        local now = mp.get_time()
+        local dt = math.max(0, math.min(0.05, now - related_at))
+        related_at = now
+        local p = advance(pan, dt, 0.0004)
+        local x = advance(fx, dt, 0.2)
+        local y = advance(fy, dt, 0.2)
+        local max_scroll = math.max(0, math.ceil(#related.items / RCOLS) - RROWS)
+        related_scroll = math.floor(math.max(0, math.min(max_scroll, pan.value)) * RSTEP + 0.5) / RSTEP
+        render()
+        if not p and not x and not y then related_timer:kill(); related_timer = nil end
+    end)
+end
+
+render_related = function(a)
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H20&}")
+    a:draw_start()
+    a:rect_cw(-200, RY - 150, W + 200, H + 200)
+    a:draw_stop()
+    a:new_event()
+    a:append(string.format("{\\an1\\pos(%d,%d)\\bord0\\shad0\\fs30\\b1\\1c&HFFFFFF&\\1a&H00&}Related videos", RX, RY - 34))
+    if related.loading or related.error then
+        a:new_event()
+        a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs26\\1c&HFFFFFF&\\1a&H40&}%s",
+            RX, RY + 20, related.error and clean(related.error) or "Loading…"))
+        related_overlays(nil)
+        return
+    end
+    local n = #related.items
+    a:new_event()
+    a:append(string.format("{\\an3\\pos(%d,%d)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H50&}%d / %d",
+        W - RX, RY - 34, related.index, n))
+    local first = math.floor(related_scroll) * RCOLS + 1
+    for i = first, math.min(n, first + RCOLS * (RROWS + 1) - 1) do
+        local it = related.items[i]
+        local x = RX + (i - 1) % RCOLS * (RW + RGAP)
+        local y = RY + (math.floor((i - 1) / RCOLS) - related_scroll) * RSTEP
+        local focused = i == related.index
+        local clip = string.format("\\clip(%d,%d,%d,%d)", RX - 12, RY - 12, W - RX + 12, H - 32)
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0" .. clip .. "\\1c&H000000&\\1a&H20&}")
+        a:draw_start()
+        rect(a, x - 5, y - 5, RW + 10, RH + 10, 18)
+        a:draw_stop()
+        local title = wrap(clean(it.t), 24, RW, 2)
+        for line, text in ipairs(title) do
+            a:new_event()
+            a:append(string.format("{\\an7\\pos(%.1f,%.1f)\\bord0\\shad1\\fs24\\b%d%s\\1c&HFFFFFF&\\1a&H%s&}%s",
+                x, y + RH + 12 + (line - 1) * 28, 0, clip, focused and "00" or "30", text))
+        end
+        a:new_event()
+        a:append(string.format("{\\an7\\pos(%.1f,%.1f)\\bord0\\shad1\\fs20%s\\1c&HFFFFFF&\\1a&H60&}%s",
+            x, y + RH + 72, clip, fit(clean(it.c), 20, RW)))
+    end
+    local x = RX + fx.value
+    local y = RY + fy.value - related_scroll * RSTEP
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord4\\shad0\\clip(108,388,1812,1048)\\1a&HFF&\\3c" .. ACCENT .. "\\3a&H00&}")
+    a:draw_start()
+    rect(a, x, y, RW, RH, 14)
+    a:draw_stop()
+    related_overlays(related.atlas)
+end
+
+local function related_close()
+    if related_timer then related_timer:kill(); related_timer = nil end
+    related = nil
+    related_overlays(nil)
+    render()
+end
+
+local function related_open()
+    related_request = related_request + 1
+    related_scroll, related_target = 0, 0
+    pan, fx, fy = {value=0,speed=0,target=0}, {value=0,speed=0,target=0}, {value=0,speed=0,target=0}
+    related = { index = 1, loading = true, request = tostring(related_request) }
+    render()
+    mp.commandv("script-message", "cattube-related", related.request)
+end
+
+mp.register_script_message("cattube-related-data", function(id, json, request)
+    if not related or request ~= related.request or (current_video ~= "" and id ~= current_video) then return end
+    local d = utils.parse_json(json or "")
+    related.loading = false
+    if not d then
+        related.error = "YouTube didn't answer properly"
+    elseif d.error then
+        related.error = d.error
+    else
+        related.items = d.list or {}
+        related.atlas = d.atlas
+        related.legacy = not d.atlas and related.items[1] and related.items[1].p ~= nil
+        related.error = #related.items == 0 and "No related videos" or nil
+        related.index = math.max(1, math.min(related.index, #related.items))
+    end
+    render()
+end)
+
+mp.register_script_message("cattube-video", function(id)
+    current_video = id or ""
+    if related then related_close() end
+end)
+mp.register_event("file-loaded", function()
+    if related then related_close() end
+end)
+
+local function related_key(key)
+    if not related then return false end
+    local n = related.items and #related.items or 0
+    local i = related.index
+    if key == "left" then
+        if (i - 1) % RCOLS > 0 then related.index = i - 1 end
+    elseif key == "right" then
+        if i < n and i % RCOLS ~= 0 then related.index = i + 1 end
+    elseif key == "down" then
+        if math.floor((i - 1) / RCOLS) < math.floor((n - 1) / RCOLS) then
+            related.index = math.min(n, i + RCOLS)
+        end
+    elseif key == "up" then
+        if i <= RCOLS then
+            related_close()
+            focus, on_bar = pause_index(), false
+            show()
+            return true
+        end
+        related.index = i - RCOLS
+    elseif key == "ok" then
+        local it = related.items and related.items[i]
+        if it then
+            checkpoint(true, false)
+            mp.commandv("script-message", "cattube-related-pick", it.id, it.t or "", it.c or "")
+            related_close()
+        elseif related.error then
+            related_open()
+        end
+        return true
+    elseif key == "back" then
+        related_close()
+        return true
+    end
+    related_move()
+    render()
+    return true
+end
+
 local function on_ok()
+    if vol then vol_key("ok"); return end
     notify()
     if card then card_ok(); return end
+    if related_key("ok") then return end
     if menu then menu_pick(); return end
     if not shown then
         focus = pause_index()
@@ -976,13 +1409,15 @@ local function scrub(dir)
 end
 
 local function on_left()
+    if vol then vol_key("left"); return end
     notify()
     if card then card_move(-1); return end
+    if related_key("left") then return end
     if menu then return end
     if shown and on_bar then
         scrub(-1)
     elseif shown then
-        focus = (focus - 2) % #visible_buttons() + 1
+        focus = math.max(1, focus - 1)
         render()
         arm_hide()
     else
@@ -992,13 +1427,15 @@ local function on_left()
 end
 
 local function on_right()
+    if vol then vol_key("right"); return end
     notify()
     if card then card_move(1); return end
+    if related_key("right") then return end
     if menu then return end
     if shown and on_bar then
         scrub(1)
     elseif shown then
-        focus = focus % #visible_buttons() + 1
+        focus = math.min(#visible_buttons(), focus + 1)
         render()
         arm_hide()
     else
@@ -1008,15 +1445,17 @@ local function on_right()
 end
 
 local function on_up()
+    if vol then vol_key("up"); return end
     notify()
     if card then return end
+    if related_key("up") then return end
     if menu and menu.kind == "comments" then
         menu.index = math.max(1, menu.index - 1)
         render()
         return
     end
     if menu then
-        menu.index = (menu.index - 2) % #menu.items + 1
+        menu.index = math.max(1, menu.index - 1)
         render()
         return
     end
@@ -1034,8 +1473,10 @@ local function on_up()
 end
 
 local function on_down()
+    if vol then vol_key("down"); return end
     notify()
     if card then return end
+    if related_key("down") then return end
     if menu and menu.kind == "comments" then
         menu.index = math.max(1, math.min(#menu.items, menu.index + 1))
         comments_moved()
@@ -1043,27 +1484,39 @@ local function on_down()
         return
     end
     if menu then
-        menu.index = menu.index % #menu.items + 1
+        menu.index = math.min(#menu.items, menu.index + 1)
         render()
         return
     end
     if not shown then
-        focus = pause_index()
+        focus, on_bar = pause_index(), false
         show()
     elseif on_bar then
         on_bar = false
         render()
         arm_hide()
     else
-        arm_hide()
+        -- Down from the buttons: the related row instead of the controls.
+        hide()
+        related_open()
     end
 end
 
 local function on_back()
+    if vol then vol_key("back"); return end
     notify()
+    checkpoint(true, false)
     if card then card_result("cancel"); return end
+    if related_key("back") then return end
     if menu then menu = nil; render(); return end
-    if shown then hide() else mp.commandv("quit") end
+    if shown then
+        hide()
+    elseif opts.hide == "yes" then
+        -- CatTube puts its list over the video, which plays on.
+        mp.commandv("script-message", "cattube-hide")
+    else
+        mp.commandv("quit")
+    end
 end
 
 for _, k in ipairs({ "ENTER", "KP_ENTER", "SPACE" }) do
@@ -1071,13 +1524,15 @@ for _, k in ipairs({ "ENTER", "KP_ENTER", "SPACE" }) do
 end
 mp.add_forced_key_binding("LEFT", "cattube-left", on_left, { repeatable = true })
 mp.add_forced_key_binding("RIGHT", "cattube-right", on_right, { repeatable = true })
-mp.add_forced_key_binding("UP", "cattube-up", on_up)
-mp.add_forced_key_binding("DOWN", "cattube-down", on_down)
+mp.add_forced_key_binding("UP", "cattube-up", on_up, { repeatable = true })
+mp.add_forced_key_binding("DOWN", "cattube-down", on_down, { repeatable = true })
 mp.add_forced_key_binding("ESC", "cattube-back", on_back)
 mp.add_forced_key_binding("BS", "cattube-back-bs", on_back)
 -- Media keys keep working through the input conf; the bar follows pause.
 mp.observe_property("pause", "native", function(_, paused)
-    if paused then show() elseif shown then arm_hide() end
+    if not related then
+        if paused then show() elseif shown then arm_hide() end
+    end
     render()
 end)
 
@@ -1112,6 +1567,7 @@ local function arc_ring(a, cx, cy, r_out, r_in, from, to)
 end
 
 local function draw_loading()
+    if related then loading_overlay:remove(); return end
     local t = mp.get_time() - loading_since
     local a = assdraw.ass_new()
     -- Just the spinner, in the middle: no title while it loads.
@@ -1151,7 +1607,20 @@ mp.register_event("start-file", function() loading(true) end)
 mp.register_event("playback-restart", function()
     if not mp.get_property_bool("paused-for-cache", false) then loading(false) end
 end)
-mp.register_event("end-file", function() loading(false) end)
+mp.register_event("end-file", function(event)
+    checkpoint(true, event and event.reason == "eof")
+    loading(false)
+end)
+mp.register_event("shutdown", function() checkpoint(true, false) end)
+mp.observe_property("eof-reached", "bool", function(_, eof)
+    if eof and mp.get_property("loop-file", "no") ~= "inf" then checkpoint(true, true) end
+end)
+mp.register_event("seek", function()
+    if last_point then last_point.finished = false end
+end)
+mp.observe_property("time-pos", "number", function() checkpoint(false, false) end)
+mp.observe_property("pause", "bool", function() checkpoint(true, false) end)
+mp.register_event("playback-restart", function() checkpoint(true, false) end)
 mp.observe_property("paused-for-cache", "bool", function(_, waiting)
     if waiting then loading(true) elseif mp.get_property("time-pos") then loading(false) end
 end)

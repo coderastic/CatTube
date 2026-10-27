@@ -11,6 +11,7 @@
 //! the mouse, every clickable rectangle is registered with [`Canvas::hit`];
 //! the app hit-tests the pointer against last frame's list.
 
+use crate::motion;
 use crate::theme::{self, Rgb, Weight};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Mesh, Painter, Pos2, Rect, Shadow,
@@ -32,6 +33,7 @@ pub struct Canvas<H: Copy = ()> {
     pub s: f32,
     pub screen: Rect,
     hits: Rc<RefCell<Vec<(Rect, H)>>>,
+    interactive: bool,
 }
 
 impl<H: Copy> Canvas<H> {
@@ -53,6 +55,7 @@ impl<H: Copy> Canvas<H> {
             s,
             screen,
             hits: Rc::new(RefCell::new(Vec::new())),
+            interactive: true,
         }
     }
 
@@ -99,7 +102,13 @@ impl<H: Copy> Canvas<H> {
 
     /// Register a clickable rect (later registrations are on top).
     pub fn hit(&self, rect: Rect, target: H) {
-        self.hits.borrow_mut().push((rect, target));
+        if !self.interactive {
+            return;
+        }
+        let rect = rect.intersect(self.painter.clip_rect());
+        if rect.is_positive() {
+            self.hits.borrow_mut().push((rect, target));
+        }
     }
 
     /// The hit list of this frame.
@@ -379,40 +388,56 @@ impl<H: Copy> Canvas<H> {
         t
     }
 
-    /// Animate towards `target` with a short ease-out (0.18 s), keyed by
-    /// `id` (focus, the gliding highlight and scrolling all move
-    /// this way: quick start, soft landing, no overshoot).
+    /// Focus and scrolling retain their velocity during repeated input.
     pub fn anim(&self, id: impl std::hash::Hash + std::fmt::Debug, target: f32) -> f32 {
-        self.anim_ease(id, target, 0.18)
-    }
-
-    /// [`Self::anim`] over `secs`: cubic ease-out from wherever the value
-    /// is when the target changes.
-    pub fn anim_ease(
-        &self,
-        id: impl std::hash::Hash + std::fmt::Debug,
-        target: f32,
-        secs: f32,
-    ) -> f32 {
-        let id = egui::Id::new(("ease", id));
+        let id = egui::Id::new(("motion", id));
         let now = self.ctx.input(|i| i.time);
-        let secs = secs.max(0.001) as f64;
-        let value = self.ctx.data_mut(|d| {
-            let e: &mut (f32, f32, f64) =
-                d.get_temp_mut_or_insert_with(id, || (target, target, now - secs));
-            let at = |e: &(f32, f32, f64)| {
-                let t = ((now - e.2) / secs).clamp(0.0, 1.0) as f32;
-                e.0 + (e.1 - e.0) * ease_out(t)
-            };
-            if (target - e.1).abs() > 1e-4 {
-                *e = (at(e), target, now);
-            }
-            (at(e), now - e.2 < secs)
+        let (value, _, moving) = self.ctx.data_mut(|d| {
+            d.get_temp_mut_or_insert_with(id, || motion::Spring::new(target, now))
+                .sample(target, now, motion::FOCUS, 1.0)
         });
-        if value.1 {
+        if moving {
             self.ctx.request_repaint();
         }
-        value.0
+        value
+    }
+
+    pub fn entrance<K: Clone + PartialEq + Send + Sync + 'static>(
+        &self,
+        id: impl std::hash::Hash + std::fmt::Debug,
+        key: K,
+        seconds: f32,
+    ) -> f32 {
+        let id = egui::Id::new(("entrance", id));
+        let now = self.ctx.input(|i| i.time);
+        let value = self.ctx.data_mut(|d| {
+            d.get_temp_mut_or_insert_with(id, || {
+                motion::Entrance::settled(key.clone(), now, seconds)
+            })
+            .sample(key, now, seconds)
+        });
+        if value < 1.0 {
+            self.ctx.request_repaint();
+        }
+        value
+    }
+
+    pub fn translated(&self, x: f32, y: f32) -> Self {
+        let mut c = self.clone();
+        c.origin += vec2(self.len(x), self.len(y));
+        c
+    }
+
+    pub fn opacity(&self, value: f32) -> Self {
+        let mut c = self.clone();
+        c.painter.multiply_opacity(value.clamp(0.0, 1.0));
+        c
+    }
+
+    pub fn passive(&self) -> Self {
+        let mut c = self.clone();
+        c.interactive = false;
+        c
     }
 
     /// [`Self::background`] at time `t` (seconds): the light bands drift
@@ -719,12 +744,6 @@ impl<H: Copy> Canvas<H> {
     }
 }
 
-/// Cubic ease-out: fast start, soft landing, never past 1.
-pub fn ease_out(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
-}
-
 /// The blurred rounded-rect texture behind [`Canvas::soft_shadow`]: white
 /// with a Gaussian alpha (three box blurs ≈ a Gaussian of `sigma_px`),
 /// kept in egui's memory per (radius, sigma). Returns the texture, the
@@ -807,5 +826,34 @@ fn box_blur(src: &[f32], dst: &mut [f32], n: usize, r: usize, horizontal: bool) 
                 acc -= src[at(line, k - r)];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animated_targets_follow_their_content_and_clip_to_the_viewport() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let c: Canvas<u8> = Canvas::new(ui, 0);
+                let layer = c
+                    .translated(24.0, 16.0)
+                    .opacity(0.5)
+                    .clipped(100.0, 120.0, 80.0, 40.0);
+                layer.hit(layer.r(90.0, 110.0, 100.0, 60.0), 1);
+                layer.passive().hit(layer.r(100.0, 120.0, 80.0, 40.0), 2);
+                let hits = c.take_hits();
+                assert_eq!(hits, vec![(c.r(124.0, 136.0, 80.0, 40.0), 1)]);
+            },
+        )
+        .drop_without_applying_deltas();
     }
 }

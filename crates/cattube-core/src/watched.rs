@@ -89,6 +89,21 @@ pub fn remember(list: &mut Vec<Tile>, t: &Tile) {
     list.truncate(KEEP);
 }
 
+/// Record a video once it actually starts, including related and autoplay picks.
+pub fn record(data: &std::path::Path, tile: &Tile) {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let path = data.join("watched.conf");
+    let mut list = std::fs::read_to_string(&path)
+        .map(|s| parse(&s))
+        .unwrap_or_default();
+    remember(&mut list, tile);
+    let tmp = data.join(format!("watched-{}.tmp", std::process::id()));
+    if std::fs::create_dir_all(data).is_ok() && std::fs::write(&tmp, to_text(&list)).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 /// The History tab: the videos in rows of [`COLS`].
 pub fn page(list: &[Tile]) -> Page {
     Page {
