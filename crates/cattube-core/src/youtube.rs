@@ -512,6 +512,32 @@ fn find_continuation(v: &Json) -> Option<String> {
     }
 }
 
+/// A page's token belongs to the outer list, not to one of its shelves.
+fn page_continuation(v: &Json) -> Option<String> {
+    match v {
+        Json::Obj(kv) => {
+            for (key, value) in kv {
+                if key == "shelfRenderer" {
+                    continue;
+                }
+                if matches!(
+                    key.as_str(),
+                    "continuations" | "continuationItemRenderer" | "continuationItemView"
+                ) {
+                    if let Some(token) = find_continuation(value) {
+                        return Some(token);
+                    }
+                } else if let Some(token) = page_continuation(value) {
+                    return Some(token);
+                }
+            }
+            None
+        }
+        Json::Arr(items) => items.iter().find_map(page_continuation),
+        _ => None,
+    }
+}
+
 fn shelf_title(sh: &Json) -> (String, Option<String>) {
     let header = path(sh, &["headerRenderer", "shelfHeaderRenderer"]);
     let lock = header.and_then(|h| path(h, &["avatarLockup", "avatarLockupRenderer", "title"]));
@@ -585,21 +611,7 @@ pub fn parse_page(body: &str) -> Option<Page> {
             });
         }
     }
-    // A page's own continuation (more rows): the section list's.
-    let continuation = path(
-        contents,
-        &[
-            "tvBrowseRenderer",
-            "content",
-            "tvSurfaceContentRenderer",
-            "content",
-            "sectionListRenderer",
-            "continuations",
-        ],
-    )
-    .or_else(|| path(contents, &["sectionListRenderer", "continuations"]))
-    .and_then(find_continuation)
-    .or_else(|| {
+    let continuation = page_continuation(contents).or_else(|| {
         // A single list (playlist, grid) continues itself.
         (shelves.len() == 1)
             .then(|| find_continuation(contents))
@@ -1205,6 +1217,35 @@ mod tests {
     fn signed_out_home_is_empty_not_broken() {
         let p = parse_page(&fixture("home")).unwrap();
         assert!(p.tiles().is_empty());
+    }
+
+    #[test]
+    fn home_keeps_page_and_shelf_continuations_separate() {
+        let shelves = r#"[{"shelfRenderer":{"title":{"simpleText":"For you"},"content":{"horizontalListRenderer":{"items":[{"tileRenderer":{"contentId":"WhWc3b3KhnY"}}],"continuations":[{"nextContinuationData":{"continuation":"ROW_MORE"}}]}}}},{"shelfRenderer":{"title":{"simpleText":"Your channels"},"content":{"horizontalListRenderer":{"items":[{"tileRenderer":{"contentId":"B4EPW7JUMTM"}}]}}}}]"#;
+        for container in ["sectionListRenderer", "sectionListContinuation"] {
+            let body = format!(
+                r#"{{"continuationContents":{{"{container}":{{"contents":{shelves},"continuations":[{{"nextContinuationData":{{"continuation":"PAGE_MORE"}}}}]}}}}}}"#
+            );
+            let page = parse_page(&body).unwrap();
+            assert_eq!(page.shelves.len(), 2);
+            assert_eq!(page.shelves[0].continuation.as_deref(), Some("ROW_MORE"));
+            assert_eq!(page.continuation.as_deref(), Some("PAGE_MORE"));
+        }
+    }
+
+    #[test]
+    fn home_append_commands_keep_loading_after_several_rows() {
+        for item in [
+            r#"{"continuationItemRenderer":{"continuationEndpoint":{"continuationCommand":{"token":"PAGE_NEXT"}}}}"#,
+            r#"{"continuationItemView":{"continuationCommand":{"token":"PAGE_NEXT"}}}"#,
+        ] {
+            let body = format!(
+                r#"{{"onResponseReceivedActions":[{{"appendContinuationItemsAction":{{"continuationItems":[{{"shelfRenderer":{{"content":{{"items":[{{"tileRenderer":{{"contentId":"WhWc3b3KhnY"}}}}]}}}}}},{{"shelfRenderer":{{"content":{{"items":[{{"tileRenderer":{{"contentId":"B4EPW7JUMTM"}}}}]}}}}}},{item}]}}}}]}}"#
+            );
+            let page = parse_page(&body).unwrap();
+            assert_eq!(page.shelves.len(), 2);
+            assert_eq!(page.continuation.as_deref(), Some("PAGE_NEXT"));
+        }
     }
 
     #[test]

@@ -200,17 +200,88 @@ fn curl_as(
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 
-/// The YouTube TV app's sign-in client, read from its own page once per run.
+/// The YouTube TV app's sign-in client, cached for a day between runs.
 fn client() -> Result<Client, String> {
-    if let Some(c) = CLIENT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    let mut saved = CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = saved.clone() {
+        return Ok(c);
+    }
+    let path = cattube_core::env::cache_dir().join("youtube-client.json");
+    if let Some(c) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| cached_client(&s, now()))
+    {
+        cattube_core::util::make_private(&path);
+        *saved = Some(c.clone());
         return Ok(c);
     }
     let page = curl(account::TV_PAGE, None, None)?;
     let js = account::base_js_path(&page).ok_or("YouTube's TV page has changed")?;
     let base = curl(&format!("https://www.youtube.com{js}"), None, None)?;
     let c = account::parse_client(&base).ok_or("YouTube's TV app has changed")?;
-    *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
+    let text = format!(
+        "{{\"saved_at\":{},\"id\":{},\"secret\":{}}}",
+        now(),
+        mpv::json_string(&c.id),
+        mpv::json_string(&c.secret)
+    );
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = cattube_core::util::write_private(&path, &text);
+    }
+    *saved = Some(c.clone());
     Ok(c)
+}
+
+fn cached_client(text: &str, now: u64) -> Option<Client> {
+    let value = mpv::parse_json(text)?;
+    let saved = value.get("saved_at")?.as_f64()? as u64;
+    if saved > now || now - saved >= 24 * 60 * 60 {
+        return None;
+    }
+    let field = |key| {
+        value
+            .get(key)?
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control))
+            .map(str::to_string)
+    };
+    Some(Client {
+        id: field("id")?,
+        secret: field("secret")?,
+    })
+}
+
+fn forget_client() {
+    *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = std::fs::remove_file(cattube_core::env::cache_dir().join("youtube-client.json"));
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    #[test]
+    fn client_cache_expires_and_rejects_incomplete_entries() {
+        let saved = r#"{"saved_at":100000,"id":"test-client","secret":"test-secret"}"#;
+        assert_eq!(
+            cached_client(saved, 100001),
+            Some(Client {
+                id: "test-client".into(),
+                secret: "test-secret".into()
+            })
+        );
+        assert!(cached_client(saved, 100000 + 86400).is_none());
+        assert!(cached_client(saved, 99999).is_none());
+        assert!(cached_client(r#"{"saved_at":100000,"id":"test-client"}"#, 100001).is_none());
+        assert!(
+            cached_client(
+                r#"{"saved_at":100000,"id":"test-client","secret":"bad\nvalue"}"#,
+                100001
+            )
+            .is_none()
+        );
+    }
 }
 
 /// A code to show on the TV.
@@ -322,19 +393,27 @@ pub fn bearer(refresh: &str) -> Result<String, String> {
     {
         return Ok(a);
     }
-    let c = client()?;
-    let out = token_request(&account::refresh_body(&c, refresh));
-    let out = out.map_err(|e: String| friendly(&e))?;
-    match account::parse_token(&out.stdout) {
-        TokenReply::Token {
-            access, expires_in, ..
-        } => {
-            remember_token(refresh, &access, now() + expires_in);
-            Ok(access)
+    for retry in 0..2 {
+        let c = client()?;
+        let out = token_request(&account::refresh_body(&c, refresh));
+        let out = out.map_err(|e: String| friendly(&e))?;
+        match account::parse_token(&out.stdout) {
+            TokenReply::Token {
+                access, expires_in, ..
+            } => {
+                remember_token(refresh, &access, now() + expires_in);
+                return Ok(access);
+            }
+            TokenReply::Failed(e)
+                if retry == 0 && matches!(e.as_str(), "invalid_client" | "unauthorized_client") =>
+            {
+                forget_client()
+            }
+            TokenReply::Failed(e) => return Err(e),
+            _ => return Err("YouTube didn't renew the sign-in".into()),
         }
-        TokenReply::Failed(e) => Err(e),
-        _ => Err("YouTube didn't renew the sign-in".into()),
     }
+    Err("YouTube didn't renew the sign-in".into())
 }
 
 fn token(refresh: Option<&str>) -> Result<Option<String>, String> {

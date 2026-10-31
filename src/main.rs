@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 use target::Target;
 
 enum Msg {
-    Page(String, Result<Page, String>),
-    More(String, String, Result<Page, String>),
+    Page(u64, String, Result<Page, String>),
+    More(u64, String, String, Result<Page, String>),
     Search(u64, String, Result<Page, String>),
     SearchMore(u64, Result<Page, String>),
     Suggestions(String, Vec<String>),
@@ -99,6 +99,9 @@ struct App {
     was_focused: bool,
     search_generation: u64,
     search_query: String,
+    account_generation: u64,
+    page_requests: HashSet<(String, String)>,
+    home_prefetches: u8,
 }
 
 impl App {
@@ -158,6 +161,9 @@ impl App {
             search_generation: 0,
             search_query: String::new(),
             tv_code_at: None,
+            account_generation: 0,
+            page_requests: HashSet::new(),
+            home_prefetches: 0,
         };
         app.jobs.spawn(move || Msg::Tools(yt::ensure_tools(&data)));
         match start {
@@ -229,6 +235,7 @@ impl App {
     fn effect(&mut self, ctx: &egui::Context, e: Effect) {
         let yctx = self.yt_ctx();
         let refresh = self.refresh();
+        let generation = self.account_generation;
         match e {
             // History is what was watched here.
             Effect::Load(id) if id == ytc::feeds::HISTORY => {
@@ -259,29 +266,48 @@ impl App {
                     .replace_page(&id, Ok(cattube_core::watched::page(&list)));
             }
             Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
+                if !self.page_requests.insert((id.clone(), String::new())) {
+                    return;
+                }
                 self.jobs.spawn(move || {
                     let r = yt::subscriptions(&yctx, refresh.as_deref());
-                    Msg::Page(id, r)
+                    Msg::Page(generation, id, r)
                 })
             }
-            Effect::Load(id) => self.jobs.spawn(move || {
-                let mut r = yt::page(&yctx, &id, refresh.as_deref());
-                if id == ytc::feeds::HOME
-                    && let Ok(p) = r.as_mut()
-                {
-                    ytc::tidy_home(p);
+            Effect::Load(id) => {
+                if !self.page_requests.insert((id.clone(), String::new())) {
+                    return;
                 }
-                Msg::Page(id, r)
-            }),
-            Effect::LoadMore { browse_id, token } => self.jobs.spawn(move || {
-                let mut r = yt::more(&yctx, &token, refresh.as_deref());
-                if browse_id == ytc::feeds::HOME
-                    && let Ok(p) = r.as_mut()
-                {
-                    ytc::tidy_home(p);
+                if id == ytc::feeds::HOME {
+                    self.home_prefetches = 0;
                 }
-                Msg::More(browse_id, token, r)
-            }),
+                self.jobs.spawn(move || {
+                    let mut r = yt::page(&yctx, &id, refresh.as_deref());
+                    if id == ytc::feeds::HOME
+                        && let Ok(p) = r.as_mut()
+                    {
+                        ytc::tidy_home(p);
+                    }
+                    Msg::Page(generation, id, r)
+                })
+            }
+            Effect::LoadMore { browse_id, token } => {
+                if !self
+                    .page_requests
+                    .insert((browse_id.clone(), token.clone()))
+                {
+                    return;
+                }
+                self.jobs.spawn(move || {
+                    let mut r = yt::more(&yctx, &token, refresh.as_deref());
+                    if browse_id == ytc::feeds::HOME
+                        && let Ok(p) = r.as_mut()
+                    {
+                        ytc::tidy_home(p);
+                    }
+                    Msg::More(generation, browse_id, token, r)
+                })
+            }
             Effect::Search(q) => {
                 // Kept on this TV for next time (Search shows them first).
                 self.tube.remember_search(&q);
@@ -368,6 +394,7 @@ impl App {
             Effect::SwitchAccount(i) => {
                 if i < self.accounts.list.len() {
                     self.accounts.active = i;
+                    self.reset_requests();
                     self.save_accounts(ctx);
                     let c = self.ctx();
                     for e in self.tube.reset(c) {
@@ -386,6 +413,7 @@ impl App {
                     });
                 }
                 self.accounts.remove(i);
+                self.reset_requests();
                 self.save_accounts(ctx);
                 self.toast(ctx, "Signed out");
                 let c = self.ctx();
@@ -510,6 +538,7 @@ impl App {
                     .find(|r| *r == self.prefs.region)
                     .unwrap_or("US");
                 self.prefs.region = prefs::cycle(&player::REGIONS, cur, d).to_string();
+                self.reset_requests();
                 // The lists are for the old country: load them again, but
                 // stay on this row.
                 let at = match self.tube.screen() {
@@ -651,10 +680,27 @@ impl App {
     fn message(&mut self, ctx: &egui::Context, msg: Msg) {
         let c = self.ctx();
         match msg {
-            Msg::Page(id, r) => self.tube.replace_page(&id, r),
-            Msg::More(id, tok, r) => {
-                if let Ok(p) = r {
-                    self.tube.on_more(&id, &tok, p);
+            Msg::Page(generation, id, r) => {
+                if generation == self.account_generation {
+                    self.page_requests.remove(&(id.clone(), String::new()));
+                    self.tube.replace_page(&id, r);
+                    if id == ytc::feeds::HOME {
+                        self.prefetch_home(ctx);
+                    }
+                }
+            }
+            Msg::More(generation, id, tok, r) => {
+                if generation == self.account_generation {
+                    self.page_requests.remove(&(id.clone(), tok.clone()));
+                    match r {
+                        Ok(p) => {
+                            self.tube.on_more(&id, &tok, p);
+                            if id == ytc::feeds::HOME {
+                                self.prefetch_home(ctx);
+                            }
+                        }
+                        Err(e) => self.toast(ctx, &e),
+                    }
                 }
             }
             Msg::Search(generation, query, r) => {
@@ -689,6 +735,7 @@ impl App {
                         refresh_token: refresh.clone(),
                         ..account::Account::default()
                     });
+                    self.reset_requests();
                     self.save_accounts(ctx);
                     self.toast(ctx, "Signed in");
                     let yctx = self.yt_ctx();
@@ -791,6 +838,42 @@ impl App {
                     self.effect(ctx, Effect::Load(id.to_string()));
                 }
             }
+        }
+    }
+
+    fn reset_requests(&mut self) {
+        self.account_generation += 1;
+        self.search_generation += 1;
+        self.page_requests.clear();
+        self.home_prefetches = 0;
+    }
+
+    /// Show the first recommendations immediately, then fill out a short
+    /// Home page without making the user wait at its last row.
+    fn prefetch_home(&mut self, ctx: &egui::Context) {
+        if self.accounts.active().is_none() || self.home_prefetches >= 2 {
+            return;
+        }
+        let Some(page) = self
+            .tube
+            .pages
+            .get(ytc::feeds::HOME)
+            .and_then(|p| p.items().first())
+        else {
+            return;
+        };
+        if page.shelves.len() >= 8 && page.tiles().len() >= 48 {
+            return;
+        }
+        if let Some(token) = page.continuation.clone() {
+            self.home_prefetches += 1;
+            self.effect(
+                ctx,
+                Effect::LoadMore {
+                    browse_id: ytc::feeds::HOME.into(),
+                    token,
+                },
+            );
         }
     }
 
